@@ -19,8 +19,17 @@ is_sandbox = false
 
 [llm]
 # 任意 OpenAI 兼容端点，换网关/换模型只改这两行；base_url 留空 = OpenAI 官方端点。
-model      = "deepseek-ai/DeepSeek-V4-Flash"
-base_url   = "https://api.siliconflow.cn/v1"
+#
+# 现在走 DeepSeek 官方：`deepseek-flash` 就是 DeepSeek-V4.1-Flash，**原生多模态**
+# （账号 /v1/models 里 input_modalities = ["text","image"]），所以文本总结与
+# 图片理解共用这一个模型，不需要再配一个视觉模型。
+#
+# ⚠️ 这个模型的 thinking 默认**是开的**（实测：不传任何参数时返回里带
+# reasoning_content，一次「1+1」就烧掉 58 个 reasoning token）。要关掉得显式传
+# thinking={"type":"disabled"}（`extra_body`，langchain 不会自己传）。
+# 注意 reasoning token 也算在 max_tokens 里：预算给小了会 200 返回但 content 为空。
+model      = "deepseek-flash"
+base_url   = "https://api.deepseek.com/v1"
 api_key    = "${LLM_API_KEY}"
 temperature = 0.3
 max_tokens  = 2048

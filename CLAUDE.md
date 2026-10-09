@@ -725,10 +725,34 @@ flowchart TB
 
 **`[embedding]` 留在原地**：DeepSeek 官方**没有 embedding 接口**（定价页只有那两个 chat 模型），embedding 继续走硅基流动的 `Qwen/Qwen3-VL-Embedding-8B`。所以会是两个供应商并存 —— 这正是 `[llm]` / `[embedding]` 分段的设计用意。
 
-**两件还没验证的事（都要真实 Key）**：
+#### 5.1.1.2 两件"官方文档没写清"的事，已实测钉死（2026-10-09，用项目自己的 Key）
 
-1. **模型 ID 以账号为准**：官方文档写 `deepseek-flash`，但第三方聚合站多用 `deepseek-v4.1-flash`，且文档说旧 ID 仍被接受并路由。拿到 Key 后先 `GET /v1/models` 钉死，别照抄。
-2. **thinking 默认是开是关**：`api-docs.deepseek.com/guides/reasoning_model` 只写了怎么**开**（`"thinking": {"type": "enabled"}` + `"reasoning_effort": "high"`），**没写怎么关，也没说默认值**。这直接关系到本项目的 **5 分钟被动回复窗口** —— 默认开着的话总结会明显变慢。`langchain-openai` 默认不传这个字段，所以大概率走非思考模式，但必须实测。
+**① 模型 ID = `deepseek-flash`。** `GET https://api.deepseek.com/v1/models` 返回两条，其中：
+
+```json
+{"id":"deepseek-flash","name":"DeepSeek-V4.1-Flash","context_window":1048576,
+ "max_output_tokens":393216,"input_modalities":["text","image"],"output_modalities":["text"],
+ "effort":{"supported_levels":["low","high","max"],"default_level":"high"}}
+```
+
+`input_modalities` 里带 `"image"` —— 这就是"一个模型管两件事"的直接证据。另一条 `deepseek-v4-pro` 的 `input_modalities` 只有 `"text"`。**第三方聚合站写的 `deepseek-v4.1-flash` 不是官方 ID，别用。**
+
+**② thinking 默认是开的 —— 这是个真坑。** 同一个问题实测：
+
+| 请求 | 耗时 | `reasoning_content` | completion tokens |
+|:---|:---|:---|:---|
+| 不传任何参数 | 1.1s | **有（182 字）** | 60（其中 **58 是 reasoning**） |
+| `"thinking":{"type":"disabled"}` | 0.7s | 无 | 1 |
+
+`"thinking":{"type":"disabled"}` **是被接受的**（不是 400），这就是关掉它的写法。三个后果：
+
+- 🔴 **reasoning token 计入 `max_tokens`。** 实测把 `max_tokens` 设成 64 让模型看图，返回 HTTP 200 但 `content` 是**空字符串** —— 64 个 token 全被 reasoning 吃光。`[llm].max_tokens` 现在是 2048，而本项目单段摘要上限 1500 字（≈1500–2000 token），**默认配置下摘要有可能被 reasoning 挤到截断甚至整段为空**。
+- 每次 agent 往返都多烧一轮 reasoning，而 agent 本来就要多轮工具调用。
+- 直接撞 5 分钟被动回复窗口。
+
+`langchain-openai` **不会**自己传这个字段，所以照现在的代码跑就是"thinking 全开"。要关掉须在 `init_chat_model(...)` 的入参里加 `extra_body={"thinking": {"type": "disabled"}}`（`ChatOpenAI` 的标准参数，`init_chat_model` 会透传），位置就是 `src/api/llm_client.py:41` 的 `overrides`。
+
+**③ 视觉确实通了**：64×64 纯色 PNG + `detail:"low"` → HTTP 200，`prompt_tokens=224`（图 ≈209 + 文本 15），说明图被真正解析过 —— 若模型不收图，前面在硅基流动上见过的是 `400 code=20041`。
 
 #### 5.1.2 图片拿得到吗（2026-10-09 实测，结论未完成）
 
