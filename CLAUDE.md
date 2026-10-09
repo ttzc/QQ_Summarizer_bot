@@ -10,7 +10,7 @@ QQ 群消息总结机器人：接入 QQ 官方机器人（群聊能力）接收�
 
 ## 项目现状
 
-**实现已完成（脱机可验证部分）**：脱机测试 **258 条断言**全绿。未完成的只剩真机联调（见 §五）。
+**实现已完成（脱机可验证部分）**：脱机测试 **265 条断言**全绿。未完成的只剩真机联调（见 §五）。
 
 ```mermaid
 flowchart LR
@@ -457,14 +457,48 @@ from langchain.tools import ToolRuntime, tool
 @tool
 async def recent_messages(
     limit: int = 200,
-    *,                                   # runtime 必须是关键字参数
-    runtime: ToolRuntime[BotContext],    # 名字必须叫 runtime、类型必须是 ToolRuntime
+    *,                                        # runtime 必须是关键字参数
+    runtime: ToolRuntime[BotContext, dict],   # 名字必须叫 runtime、类型参数不能省
 ) -> str:
     """取本群最近 limit 条消息。"""
     group_openid = runtime.context.group_openid   # 服务端注入，LLM 碰不到
 ```
 
 配套 `create_agent(..., context_schema=BotContext)` + 每轮 `ainvoke(..., context=BotContext(group_openid=...))`。不需要 `Annotated` 包装。
+
+#### ⚠️ 类型参数不能省：裸 `ToolRuntime` 会让每次工具调用刷一条 pydantic 告警
+
+`ToolRuntime` 是**泛型 dataclass**，两个 TypeVar **都带默认值**（`tool_node.py:105-106`）：
+
+```python
+StateT   = TypeVar("StateT",   default=dict)
+ContextT = TypeVar("ContextT", default=None)     # ← 陷阱在这里
+```
+
+写成裸 `runtime: ToolRuntime` 时，langchain 给工具建的 args schema 里那个字段就是**未参数化**的 `ToolRuntime`（`langchain_core/utils/pydantic.py` 的 `create_model` 原样保留注解），pydantic 于是**用 TypeVar 默认值**去解析它 → `runtime.context` 的 schema 变成 `None`。
+
+而 `BaseTool._parse_input` 每次调用都要 dump 一遍校验结果：
+
+```python
+# langchain_core/tools/base.py:835
+result_v2 = input_args.model_validate(tool_input)
+result_dict = result_v2.model_dump()      # ← 这里对着 BotContext 报 "Expected `none`"
+```
+
+症状是**每次工具调用**都在 stderr 上刷：
+
+```
+UserWarning: Pydantic serializer warnings:
+  PydanticSerializationUnexpectedValue(Expected `none` - serialized value may not be as expected
+    [field_name='context', input_value=BotContext(...), input_type=BotContext])
+```
+
+两个容易被它绕进去的点：
+
+- **功能完全正常**。校验那一侧对这两个字段足够宽松，`runtime.context` 拿到的仍是真 `BotContext`（`test_agent_boundary` 的越权断言一直是通过的），所以这是**纯 stderr 噪音**，但长得像缺陷。
+- **`_RT` 之类的替身测不出来**。直接调 `tool.coroutine(..., runtime=替身)` 会绕过 `_parse_input`，只有真的走一遍 ToolNode 才会触发。`test_offline.py` 因此把"真实注入路径不产生 pydantic 序列化告警"单独列了一条断言，并静态断言 6 个工具的 `runtime` 注解都带类型参数。
+
+改法就是补上类型参数：`runtime: ToolRuntime[BotContext, dict]`。`StateT` 的默认值本来就是 `dict`，所以 `ToolRuntime[BotContext]` 也不告警；只有 `ContextT` 的默认值 `None` 会踩坑。参数化不影响注入：`_is_injected_arg_type` 认的是 `get_origin(annotation)`，订阅形式照样命中 `_DirectlyInjectedToolArg`。
 
 **为什么 `group_openid` 绝不能做成 LLM 可填的参数**：LLM 可能填错、可能被群消息里的注入文本诱导去读**别的群**——那既是串味也是隐私泄漏。
 
@@ -623,7 +657,7 @@ flowchart TB
 
 ## 五、待办 / 下一步
 
-**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI —— 见 §项目现状，脱机测试 **258 条断言**全绿。
+**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI —— 见 §项目现状，脱机测试 **265 条断言**全绿。
 
 **剩余（按能否脱机划分为两类）**：
 

@@ -14,6 +14,19 @@
 Detected by parameter *name* (`runtime`) and by annotation (`ToolRuntime`, which
 subclasses `_DirectlyInjectedToolArg`) — `_get_all_injected_args` checks both.
 
+**Annotate it `ToolRuntime[BotContext, dict]`, never bare.** `ToolRuntime` is a
+generic *dataclass* over `(ContextT, StateT)` whose `TypeVar`s carry defaults
+(`tool_node.py:105-106`: `StateT = TypeVar("StateT", default=dict)`,
+`ContextT = TypeVar("ContextT", default=None)`). Bare, pydantic substitutes the
+defaults while building the args schema, so `runtime.context` is typed `None`;
+handing it a real `BotContext` then makes `BaseTool._parse_input`'s
+`result_v2.model_dump()` (`langchain_core/tools/base.py:835`) emit
+`PydanticSerializationUnexpectedValue` on every single tool call. Validation is
+lenient enough that the tool still works, which is exactly what makes it a bad
+warning: pure stderr noise that looks like a defect. Parameterising the two
+type vars removes it — same schema detection (`_is_injected_arg_type` unwraps
+`get_origin`), same injection, same stripped-args guarantee.
+
 **Two tool sets, because the boundary points in opposite directions.** A group
 answer must not reach outside its group; a private-chat answer is *supposed* to
 span groups. Those cannot be the same graph, or the group graph would contain the
@@ -205,7 +218,7 @@ def _resolve_group(ref: str, store: SQLStore) -> str | None:
 
 
 @tool
-async def current_time(*, runtime: ToolRuntime) -> str:
+async def current_time(*, runtime: ToolRuntime[BotContext, dict]) -> str:
     """获取当前本地时间（ISO8601，含时区）。
 
     用它把"今天""昨天""最近一小时"这类相对说法换算成具体时间范围，再交给
@@ -215,7 +228,9 @@ async def current_time(*, runtime: ToolRuntime) -> str:
 
 
 @tool
-async def recent_messages(limit: int = 200, *, runtime: ToolRuntime) -> str:
+async def recent_messages(
+    limit: int = 200, *, runtime: ToolRuntime[BotContext, dict]
+) -> str:
     """取本群最近 limit 条消息，按时间正序，每行形如"[2026-07-21 08:00] 昵称: 内容"。
 
     当用户说"总结一下""刚才聊了什么"而没有给出明确时间范围时用它。
@@ -231,7 +246,11 @@ async def recent_messages(limit: int = 200, *, runtime: ToolRuntime) -> str:
 
 @tool
 async def messages_in_range(
-    start_iso: str, end_iso: str, limit: int = 500, *, runtime: ToolRuntime
+    start_iso: str,
+    end_iso: str,
+    limit: int = 500,
+    *,
+    runtime: ToolRuntime[BotContext, dict],
 ) -> str:
     """取本群在指定时间范围内（含两端）的消息，按时间正序。
 
@@ -261,7 +280,9 @@ async def messages_in_range(
 
 
 @tool
-async def search_summaries(query: str, k: int = 5, *, runtime: ToolRuntime) -> str:
+async def search_summaries(
+    query: str, k: int = 5, *, runtime: ToolRuntime[BotContext, dict]
+) -> str:
     """对**已有的总结文档**做语义检索，返回最相关的 k 篇（含群、时间范围与正文）。
 
     适用于"之前是不是聊过 X""有人提过 Y 吗"这类按主题而非按时间的查找。
@@ -304,7 +325,7 @@ async def search_summaries(query: str, k: int = 5, *, runtime: ToolRuntime) -> s
 
 
 @tool
-async def list_groups(*, runtime: ToolRuntime) -> str:
+async def list_groups(*, runtime: ToolRuntime[BotContext, dict]) -> str:
     """列出目前**有总结**的群（群名、总结篇数、时间范围）。仅私聊场景可用。
 
     当用户问"你都知道哪些群""有没有关于 X 的群"时用它，好让用户知道可检索的
@@ -329,7 +350,7 @@ async def messages_across_groups(
     keyword: str | None = None,
     limit: int | None = None,
     *,
-    runtime: ToolRuntime,
+    runtime: ToolRuntime[BotContext, dict],
 ) -> str:
     """按时间范围取**所有群**的原始聊天记录（每行带群名、时间、发言人）。仅私聊可用。
 

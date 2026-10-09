@@ -19,8 +19,10 @@ import asyncio
 import json
 import sys
 import tempfile
+import warnings
 from datetime import datetime
 from pathlib import Path
+from typing import get_origin
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -1011,6 +1013,24 @@ def test_agent_boundary() -> None:
                 str(visible | internal),
             )
 
+    # `runtime` must be annotated `ToolRuntime[BotContext, dict]`, never bare.
+    # `ToolRuntime` is a generic dataclass over `(ContextT, StateT)` and both type
+    # vars carry defaults (`tool_node.py:105-106`: `ContextT` defaults to `None`).
+    # Bare, pydantic substitutes those defaults while building *this* args schema,
+    # so `runtime.context` is typed `None`; handing it a real `BotContext` then
+    # makes `BaseTool._parse_input`'s `result_v2.model_dump()`
+    # (`langchain_core/tools/base.py:835`) emit a serializer warning on every tool
+    # call. Validation is lenient enough that the tool still runs — which is what
+    # makes it worth a test: the only symptom is stderr noise that looks like a
+    # defect. Asserted statically so a bare annotation cannot come back quietly.
+    for name, tool in {**group_by_name, **c2c_by_name}.items():
+        injected = tool.get_input_schema().model_fields["runtime"].annotation
+        check(
+            f"{name}: runtime 带类型参数",
+            get_origin(injected) is not None,
+            repr(injected),
+        )
+
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         store = SQLStore(Path(tmp) / "a.db")
         index = SummaryIndex(
@@ -1293,7 +1313,14 @@ def test_agent_boundary() -> None:
         model = ToolCallingFakeModel(responses=[forged, final])
 
         summarizer = Summarizer(store, index, model=model)
-        result = asyncio.run(summarizer.summarize_group("G_demo", "总结一下最近的消息"))
+        # This goes through ToolNode's real injection (the `_RT` stand-in above
+        # bypasses `_parse_input` entirely), so it is the only place the pydantic
+        # serializer path is exercised end to end.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = asyncio.run(summarizer.summarize_group("G_demo", "总结一下最近的消息"))
+        noise = [str(w.message).splitlines()[0] for w in caught if "Pydantic serializer" in str(w.message)]
+        check("真实注入路径不再触发 pydantic 序列化告警", not noise, str(noise[:2]))
         check("返回最终回答", "蓝色鲸鱼" in result.text, result.text)
         # Coverage is carried out of the graph by mutating the context object,
         # which only works because LangGraph passes an instance by reference.
