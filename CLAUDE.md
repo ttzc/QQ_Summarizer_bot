@@ -394,8 +394,9 @@ HttpErrorDict = {401: ..., 403: ..., 404: ..., 405: ..., 429: SequenceNumberErro
 ### 1.9 使用前提（决定能不能跑起来）
 
 - **主体认证分级**：未认证只能加"自己是群主"的群；**个人认证**即可公开使用，进群上限 500；企业认证无明确上限。个人开发者可用群聊。
-- **必须由群主在手机 QQ 里逐群授权**：「接收全量消息」→ 不开就只有 @消息；「主动推送消息」→ 不开就无法主动发言；「撤回成员消息」→ 需机器人是群管理员。
-- **全量消息权限**：`GROUP_MESSAGE_CREATE` 需要在开放平台申请「接收所有消息」并审核通过，且**没有 API，只能后台操作**；平台事件订阅和本地 intent 必须同时包含。（官方 Intents 总表 `payload.html` 只列了 `GROUP_AT_MESSAGE_CREATE`，未列 `GROUP_MESSAGE_CREATE`，以事件详情页为准。）
+- **必须由群主在手机 QQ 里逐群授权**：三个开关都在同一个页面 —— **手机 QQ → 该群 → 群设置 → 「群机器人」→ 该机器人 → 机器人设置**：「**机器人可获取的群聊消息范围**」（不开就只有 @消息）、「机器人主动在群聊内发言」（不开就无法主动发言）、撤回成员消息（需机器人是群管理员）。**只能群主操作，每个群各设一次。**
+- **全量消息权限：开关在群设置里，不在开放平台**（2026-10-09 真机实测）。`GROUP_MESSAGE_CREATE` 唯一需要的就是上面那个群主开关 —— 实测把「机器人可获取的群聊消息范围」设为「**获取群内全部消息**」之后事件即正常下发，**没有走开放平台的审核申请**。官方事件页只说"当机器人开启了『接收所有消息』功能后…"，**通篇没给 UI 位置**；上面的路径来自第三方文档（AstrBot / MaiBot），实测与该描述一致。平台的「事件订阅」保持与本地 intent 一致即可。（官方 Intents 总表 `payload.html` 只列了 `GROUP_AT_MESSAGE_CREATE`，未列 `GROUP_MESSAGE_CREATE`，以事件详情页为准。）
+- **怎么判断权限生效没有**（排查"收不到非 @ 消息"时的第一招）：看库里那一行的三个字段 —— `event_id` 是**裸消息 ID**、`author_name` 有昵称、`raw_json` 非空（整个 WS 帧）= 走全量事件；`event_id` 形如 `GROUP_AT_MESSAGE_CREATE:<事件id>`、`author_name` 为 `NULL`、`raw_json` 为 `{}` = 走 `GroupMessageRecord.from_at_message` 退路（botpy 的 `GroupMessage` 只填了它读的那几个字段）。`qqbot stats` 的「消息数」不涨是最直接的信号。
 - 管理员账号可直接测试，新版管理端**无需沙箱**。
 
 ### 1.10 基址不一致（注意）
@@ -552,7 +553,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 ```mermaid
 flowchart TB
-    G["QQ 群"] -->|"群主授权「接收全量消息」<br/>+ 开放平台申请「接收所有消息」"| WS["GROUP_MESSAGE_CREATE（WS 下行）"]
+    G["QQ 群"] -->|"群主在群设置里把「群聊消息范围」<br/>设为「获取群内全部消息」（每群各一次）"| WS["GROUP_MESSAGE_CREATE（WS 下行）"]
     WS --> P["SummarizerClient._parse_group_message_create<br/>继承 Client，补 botpy 缺失的解析器（见 §1.7）<br/>同步、不许抛异常 → 只做「构造对象 + dispatch」"]
     P --> REC["GroupMessageRecord.from_payload()<br/>保住 author.username / message_type /<br/>msg_elements / mentions —— botpy 全丢了"]
     REC --> DUP{"插入条数 = 0 ？<br/>（= 重复事件）"}
@@ -661,17 +662,44 @@ flowchart TB
 
 **剩余（按能否脱机划分为两类）**：
 
-需要真实凭据 / 真机，我无法离线验证：
+真机上**已经跑通**的（2026-10-09 一次实跑，凭据为用户自有网关；证据是 `data/qqbot.db` + `logs/app.log`）：
 
-- [ ] 开放平台申请「接收所有消息」权限；请群主在群设置里开启「获取群内全部消息」。**这是最大不确定性**：批不下来就只能退化成"总结被 @ 的消息"（`GroupMessageRecord.from_at_message` 这条退路已预留）。
-- [ ] `uv run qqbot reindex` 打真实 embedding 网关，确认远端兼容（必要时调 `MAX_EMBED_BATCH`）。
-- [ ] `uv run qqbot ask "总结最近 50 条" --save` 全链路联调（需真实 LLM key），再 `qqbot summaries` 确认落库。
-- [ ] 真机验证被动回复：`msg_seq` 递增是否被接受、单条消息 5 次上限的实际行为、5 分钟窗口边界。
-- [ ] 真机验证**私聊**：`on_c2c_message_create` 是否真的下发、`post_c2c_message` 是否被接受。C2C 的"最多 5 次被动回复"未经官方文档核实（只有 5 分钟窗口有 docstring 依据）。
-- [ ] 真机验证**自动总结**：真实节奏与配额消耗（`min_messages` / `cooldown_s` 设得对不对，用 `qqbot stats` 的「待总结」列看）；`notify = true` 时还需群主开「主动推送消息」，否则那条主动消息发不出去。
+- [x] **全量消息权限**：群主在群设置里把「机器人可获取的群聊消息范围」设为「获取群内全部消息」后，`GROUP_MESSAGE_CREATE` 正常下发 —— 收到非 @ 消息、引用消息（`message_type=103`）、图片消息与 QQ 表情，`author_name` 有真实昵称。（开启前那条 @ 消息走的是 `from_at_message` 退路，可对照 §1.9 那三个字段判断。）
+- [x] **真实 embedding 网关**：总结入库后索引批次完成、`indexed=1`，说明远端接受该模型与批次大小。
+- [x] **真实 LLM 网关 + 全链路**：@ 触发一次总结（`trigger=at`、321 字、覆盖 11 条消息）→ 落库 → 建索引 → 回复发出（`error=null`）。
+- [x] **私聊链路**：`on_c2c_message_create` 真的下发、`post_c2c_message` 被接受并成功回复。
+- [x] **自动总结的判定**：真机上跑过跳过分支（`本群已有总结在跑，跳过自动总结`），说明 `group_busy` 闸门在真实并发下有效。
+
+仍未验证的（真机，我无法离线替代）：
+
+- [ ] 真机验证被动回复的**边界**：`msg_seq` 递增（>1 段）、单条消息 5 次上限的实际行为、5 分钟窗口的降级（转主动消息）。目前只发出过单段。
+- [ ] 真机验证**自动总结真的触发一次**：需要该群攒到 `min_messages`（默认 200）条新消息，或临时把阈值调小；`notify = true` 时还需群主开「机器人主动在群聊内发言」，否则那条主动消息发不出去。
 - [ ] 真机验证**跨群原文检索**：私聊问"把这两天的原始消息列出来"，确认 `messages_across_groups` 的时间边界与 `raw_limit` 在真实网关上表现正常。
+
+### 5.1 下一步：多模态（图片 / 语音）
+
+现状：图片与语音都只是**文本占位**，没有进入语义层。
+
+- 图片在 `Attachment.label()`（`events.py:89`）里渲染成 `[图片 <filename>]`，而真机的 `filename` 是一串大写十六进制 + 扩展名（形如 `6A3051F3….jpg`），**信息量≈0**。
+- 语音取 `asr_refer_text`（QQ 侧的转写），渲染成 `[语音转写 …]`；没有转写就没有可用文本。
+- QQ 表情在正文里是 `<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">` 这类原始编码，未渲染。
+
+已经就位、可以直接用的东西：
+
+- `Attachment`（`events.py:56`）已经解析并**持久化** `url` / `filename` / `content_type` / `size` / `width` / `height`，逐字原文在 `raw_json` 里 —— **图片 URL 本来就在库里，只是没人读**（实测 `content_type=image/jpeg`、`width=196`、`height=231`）。
+- `[embedding].model` 现在填的就是 VL 模型；但目前只有**总结文本**进向量库，图片本身不入库。
+
+两个候选接入点（各有取舍，尚未选择）：
+
+1. **入库时转写**：消息落库时对图片跑一次"看图说话"，把结果并进 `content`（`body()` 的产物）。下游 agent、检索、总结**一律不用改**，改动面最小。
+2. **取数时传图**：把图片 URL 作为 image content block 发给 vision LLM。更保真（能追问细节），但每轮都花 token，且 `_render` 的 12000 字预算**管不到图片**，上下文失控的风险要单独处理。
+
+⚠️ **必须先核实的前提：QQ 附件 URL 的时效性。** 实测 URL 形如
+`https://multimedia.nt.qq.com.cn/download?appid=<QQ 侧 appid>&fileid=<密文>&rkey=<下载密钥>&spec=0`
+—— 带 `rkey`（下载密钥）参数，**几乎肯定是限时签名链接**。如果过期后取不到图，方案 2 就只能对"刚到达的消息"生效，历史图片永远读不了；而方案 1 在入库那一刻就取用，天然免疫。**这条决定架构，得先在真机上验一下 URL 的有效期。**
 
 纯文档 / 排期：
 
 - [x] `README.md` / `docs/ARCHITECTURE.md` / `docs/DATA_MODEL.md` 已按"一次总结一篇文档"重写。
 - [ ] `InMemorySaver` 重启即丢；要跨重启保留会话需 `uv add langgraph-checkpoint-sqlite`。
+- [ ] `src/` 模块在 **import 时**调用 `setup_logger()`（如 `src/agent/tools.py:54`），所以跑 `test/test_offline.py` 会往 `logs/app.log` 追加一堆测试日志；让日志目录可按环境变量覆盖即可解决。
