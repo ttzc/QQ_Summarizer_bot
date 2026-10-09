@@ -1,0 +1,217 @@
+# QQ_Summarizer_bot
+
+QQ 群消息总结机器人。常驻在线接收群聊消息并落库，**被 @ 时**按用户的指令（"今天聊了什么""之前有人提过 X 吗"）总结本群内容，**消息攒够一定量也会自动总结一次**；**每次总结本身就是一篇知识文档**，被索引进向量库，私聊机器人即可就这些文档跨群提问，也可以按时间范围翻某个群的聊天原文。
+
+基于 `qq-botpy`（QQ 官方机器人 SDK）+ LangChain 工具调用 agent。
+
+---
+
+## 功能
+
+- **接收群内全部消息**：不只是 @ 机器人的消息（需要平台权限，见下方「使用前提」）。
+- **自建消息库**：官方不提供拉取历史消息的接口，所以机器人上线后的每条群消息都会落进本地 SQLite。
+- **两种触发方式**：被 @ 时按指令总结；此外每个群"距上次总结新增 ≥ `min_messages` 条"时会**自动总结一次**，默认静默入库、不发群消息（`notify = true` 可改成顺带发到群里）。
+- **一次总结 = 一篇文档**：不是每条消息一个向量，而是每次总结产出一篇文档后再异步建索引。成本不随消息量增长，检索命中的也是一段结论而不是一句碎片。
+- **动态决定总结范围**：LLM 根据用户指令自己选工具——取最近 N 条 / 按时间范围取 / 对历史总结做语义检索。
+- **群隔离**：群内问答只能读到当前这一个群的消息与总结，群标识由服务端注入，模型无法指定。
+- **私聊跨群检索**：私聊机器人可以用已有的总结回答"哪个群聊过 X"，也可以用按时间范围读**聊天原文**核对原话、找细节。
+- **被动回复合规**：自动分段（≤5 条）、`msg_seq` 递增、接近 5 分钟窗口时降级为主动消息（私聊不降级）。
+
+---
+
+## 工作原理
+
+```mermaid
+flowchart TB
+    G["QQ 群"] -->|"① 群主授权「接收全部消息」<br/>+ 平台申请「接收所有消息」"| WS["GROUP_MESSAGE_CREATE<br/>经 WebSocket 下行"]
+    WS --> C["SummarizerClient（继承 botpy.Client）<br/>自注册 botpy 1.2.1 缺失的事件解析器"]
+    C --> R["GroupMessageRecord<br/>保住昵称 / 引用 / 合并转发"]
+    R --> DB[("② SQLite data/qqbot.db<br/>唯一真相源，INSERT OR IGNORE 去重<br/>原文只按时间 / 条数查，不做语义检索")]
+
+    DB --> ATQ{"这条消息 @ 了机器人吗？"}
+    ATQ -->|"是"| GA["③ Summarizer agent（群 scope）<br/>按指令自选工具取数 → 生成总结"]
+    ATQ -->|"否"| CNTQ{"⑥ 距本群上次总结新增的消息<br/>达到 min_messages 且冷却已过？"}
+    CNTQ -->|"否"| NOTHING["什么都不做<br/>下一条消息到达时再判"]
+    CNTQ -->|"是"| AUTO["Summarizer agent（同一条群会话）<br/>用固定指令总结"]
+
+    SUM["⑤ summaries 表：一次总结一行<br/>→ 唤醒后台索引器"]
+    GA -->|"先落库"| SUM
+    GA -->|"再发回群（与落库互不依赖）"| REPLY["④ reply_chunked 分段发回群"]
+    AUTO -->|"先落库"| SUM
+    SUM --> NQ{"notify = true ？"}
+    NQ -->|"否（默认）"| QUIET["静默结束，文档已在库里"]
+    NQ -->|"是"| PUSH["再作为主动消息发到群里"]
+
+    SUM --> IX["后台 indexer：一篇总结一个向量"]
+    IX --> CH[("Chroma data/chroma_db/")]
+
+    C2C["QQ 私聊"] -->|"C2C_MESSAGE_CREATE"| PA["Summarizer agent（私聊 scope，可跨全部群）<br/>检索总结 + 按时间范围读原文 + 列出有哪些群"]
+    PA -->|"私聊回答不入库，直接回"| PREPLY["reply_chunked(kind='c2c')"]
+```
+
+值得注意的是 **①**：botpy 1.2.1 的实现里没有 `GROUP_MESSAGE_CREATE` 这个事件，事件推过来会被它打一行日志后直接丢掉。本项目通过继承 `Client` 注册缺失的解析器补齐（见 `docs/ARCHITECTURE.md`）。
+
+**⑥ 为什么可以直接在消息回调里 `await` 一次总结**：botpy 把每个事件都放进独立的 asyncio Task（`client.py:250` 的 `create_task`），所以等待总结不会卡住 WebSocket 读循环，也不会拖住别的群。判定本身是同步的（读配置 + 内存冷却 + 一次走索引的计数查询），只有通过判定才真的调模型。
+
+**私聊为什么能读原文**：私聊的入口就是开发者通道——QQ 私聊没有别的鉴权手段，访问面由平台层（谁有资格私聊这个机器人）收敛，应用层再用 `[c2c] allowlist` 兜底。在这个前提下，给私聊一个按时间范围跨群取原文的工具，正是"对知识库做 RAG"所需的能力。群内 agent 则**没有**这个工具：能力差异直接体现在两个 agent 的工具集上，而不是运行时开关。
+
+---
+
+## 快速开始
+
+### 环境要求
+
+- Python **>= 3.13**（`.python-version` 锁定）
+- [`uv`](https://docs.astral.sh/uv/)
+
+### 安装
+
+```bash
+uv sync
+```
+
+### 配置
+
+```bash
+cp .env.example .env
+```
+
+然后在 `.env` 里填两组凭据：
+
+| 变量 | 必填 | 说明 |
+|:---|:---:|:---|
+| `QQ_APPID` | ✅ | QQ 开放平台 → 机器人管理端 → 开发设置 |
+| `QQ_SECRET` | ✅ | 同上 |
+| `LLM_MODEL` | ✅ | 任意 OpenAI 兼容模型名 |
+| `LLM_BASE_URL` | ⬜ | 留空则走 OpenAI 官方端点；用别家网关填它的兼容端点地址 |
+| `LLM_API_KEY` | ✅ | LLM 网关的 key |
+| `EMBED_MODEL` | ✅ | embedding 模型名（可与 LLM 不同网关） |
+| `EMBED_BASE_URL` / `EMBED_API_KEY` | ⬜ | 同上 |
+
+`.env` 已在 `.gitignore` 中，**不要把真实凭据提交进仓库**。
+
+其余参数在 `config.toml`，按段划分：
+
+| 段 | 关键项 |
+|:---|:---|
+| `[qq]` | `is_sandbox`（新版管理端一般填 `false`） |
+| `[llm]` | `temperature` / `max_tokens` / `timeout` |
+| `[embedding]` | `batch_size`（默认 25，保守值；网关吃得下更大批再调高 `MAX_EMBED_BATCH`） |
+| `[store]` | SQLite 路径、Chroma 路径与 collection 名（`summaries`） |
+| `[summary]` | `default_recent_n` / `max_reply_chars` / `max_replies` / `passive_reply_deadline_s` |
+| `[auto_summary]` | `enabled` / `min_messages`（阈值）/ `cooldown_s`（两次尝试的最小间隔）/ `notify`（是否发到群里）/ `groups`（白名单，空 = 全部群）/ `instruction` |
+| `[c2c]` | `enabled` / `allowlist`（空 = 任何人可私聊检索）/ `max_groups_shown` / `raw_limit`（一次取原文的条数上限） |
+| `[groups]` | 可选的群 `openid` → 人话名字映射，会出现在私聊回答里 |
+| `[logging]` | 日志级别与目录 |
+
+`config.toml` 里的 `${VAR}` 会在启动时从 `.env` 展开；某个变量没设时保持原样，对应配置项按"未设置"处理（而不是把 `"${VAR}"` 当成真的值发出去）。
+
+`[auto_summary]` 的默认值是：每群累计 200 条新消息触发一次，两次尝试至少间隔 1800 秒（**失败也算**，否则网关出故障时每条消息都会重试一次）。消息密的群把 `min_messages` 调大，只想让部分群自动总结就用 `groups` 列 openid，不想要就 `enabled = false`。`qqbot stats` 的「待总结」列就是离触发还差多少。
+
+### 运行
+
+```bash
+uv run qqbot run          # 启动机器人（长驻进程）
+```
+
+---
+
+## 命令
+
+| 命令 | 作用 |
+|:---|:---|
+| `uv run qqbot run` | 启动机器人。长驻，需真实 QQ 凭据 |
+| `uv run qqbot stats` | 查看各群消息数、总结数、已索引数，以及「距上次总结新增了多少条」（自动总结的触发依据） |
+| `uv run qqbot summaries [--group <openid>] [--limit N]` | 列出已入库的总结（这是知识库的真实内容），并标明每篇是**被 @ 触发**还是**自动生成** |
+| `uv run qqbot reindex [--reset]` | 把 SQLite 里的**总结**灌进向量库；`--reset` 先清空向量与索引标记再全量重建 |
+| `uv run qqbot ask "<指令>" [--group <openid>] [--all] [--save]` | **脱机**跑一次问答（不连 QQ）。`--all` 走私聊 scope 跨群检索总结与原文；`--save` 把这次回答作为总结入库 |
+
+全局加 `-v` / `--verbose` 可让日志同时输出到控制台（默认只写 `logs/app.log`）。
+
+示例：
+
+```bash
+uv run qqbot ask "总结最近 50 条"
+uv run qqbot ask "今天上午大家聊了什么"
+uv run qqbot ask "之前有人提过部署方案吗" --all      # 跨群，走私聊那条路
+uv run qqbot ask "把这两天的原始消息列出来" --all    # 私聊还能按时间范围读原文
+uv run qqbot ask "总结最近 50 条" --save            # 顺带入库，之后可被检索到
+uv run qqbot summaries --limit 5                   # 看看知识库里都有什么
+uv run qqbot stats                                 # 看各群离自动总结还差多少条
+```
+
+---
+
+## 使用前提 ⚠️
+
+**这一节决定了机器人能不能按设计工作，务必先确认。**
+
+1. **平台权限**：`GROUP_MESSAGE_CREATE`（"接收所有消息"）需要在 QQ 开放平台申请并通过审核。**没有 API，只能在后台操作**，且平台的「事件订阅」与代码里的 intent 必须同时开启。
+2. **群主授权**：每个群都需要群主在手机 QQ 的群设置里逐群开启「接收全部消息」。
+3. **拿不到权限时的降级**：只有 @ 机器人的消息会到达。机器人仍可工作（`on_group_at_message_create` 路径已实现），但**只能总结被 @ 的那条消息**，无法总结群聊上下文。此时摘要里也不会有发言人昵称（botpy 的 `GroupMessage` 拿不到）。
+4. **私聊**：私聊事件（`C2C_MESSAGE_CREATE`）与群事件共用 `public_messages` intent，botpy 原生支持，无需申请额外权限；但用户需要在 QQ 里能加机器人好友并打开会话。私聊的可见范围（含原文）见「已知限制」。
+
+另外：发消息接口要求 WebSocket 保持在线，所以机器人必须是常驻进程，不能当离线脚本跑。
+
+---
+
+## 项目结构
+
+```mermaid
+flowchart LR
+    ROOT["QQ_Summarizer_bot/"]
+    ROOT --- MAIN["main.py<br/>薄包装 → scripts.cli:main"]
+    ROOT --- CFG["config.toml<br/>业务配置（${VAR} 从 .env 展开）"]
+    ROOT --- ENVF[".env.example<br/>入库；.env 不入库"]
+    ROOT --- PROMPT["prompts/<br/>common.md（两 scope 共用）<br/>+ summarizer.md / c2c.md"]
+    ROOT --- CLI["scripts/cli.py<br/>命令行入口"]
+    ROOT --- TEST["test/test_offline.py<br/>脱机验证套件"]
+    ROOT --- DOCS["docs/<br/>架构与数据模型文档"]
+    ROOT --- SRC["src/"]
+
+    SRC --- SC["config.py<br/>Pydantic 配置 + ${VAR} 展开"]
+    SRC --- SL["logger.py<br/>JSON Lines 日志"]
+    SRC --- SA["api/<br/>LLM / embedding 客户端"]
+    SRC --- SB["bot/<br/>事件解析、Client 子类、回复发送"]
+    SRC --- SS["store/<br/>SQLite 持久化（原文 + 总结）"]
+    SRC --- SR["rag/<br/>总结的向量索引（写）与检索（读）"]
+    SRC --- SG["agent/<br/>工具集 + 群/私聊两个 agent"]
+```
+
+`data/`（SQLite + Chroma）与 `logs/` 为运行时生成，已 gitignore。
+
+---
+
+## 测试
+
+```bash
+uv run python test/test_offline.py
+```
+
+覆盖事件解析、SQLite 去重与时间范围查询、总结入库与索引、回复分段（群 + 私聊）、agent 工具边界与跨群可见性（含伪造 `runtime`/`scope` 的越权尝试）、以及自动总结的阈值 / 冷却 / 静默与通知 / 同群串行等 **255 条断言**，全部脱机运行，不需要任何凭据。
+
+---
+
+## 文档
+
+| 文档 | 内容 |
+|:---|:---|
+| [`CLAUDE.md`](CLAUDE.md) | botpy / LangChain 的 API 事实与坑，全部标注了 `site-packages` 源码行号 |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 模块职责、数据流、并发模型、关键设计决策与理由 |
+| [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) | 三层存储、表结构、Chroma metadata、一致性约束 |
+
+---
+
+## 已知限制
+
+- **不补历史**：只总结机器人上线后收到的消息。官方没有拉取历史的接口，这是唯一可行方案。
+- **语义检索只覆盖"已生成总结"的话题**：被 @ 触发或自动触发写成文档的那些，`search_summaries` 才查得到；还在阈值以下的讨论没有文档，但**原文仍在库里**，私聊可以用 `messages_across_groups` 按时间范围取到。这是"一次总结一篇文档"的必然结果。
+- **私聊可见面 = 所有群的总结 + 原文**：任何能私聊机器人的人都能检索**全部群**的总结**与聊天原文**（含发言人昵称），不只是结论。这是刻意的产品选择——私聊入口由平台层控制谁有资格，`config.toml` 的 `[c2c] allowlist` 是应用层兜底。**不要把这个机器人加进不该看全量消息的群**。
+- **自动总结消耗 LLM 配额**：每群每 `min_messages` 条一次（默认 200 条）。活跃群大概一天几次；不想要就 `enabled = false`，或把 `min_messages` 调大。
+- **自动总结与被 @ 复用同一条群会话记忆**：所以用户随后的 @ 会看到上一次自动总结的上下文。这通常更连贯，但意味着自动总结的措辞会影响后续回答。
+- **冷却只在内存**：进程重启后如果积压仍超阈值，会立刻再自动总结一次（多一篇文档，无害）。
+- **总结的时间范围是包络**：agent 可能分别读了"昨天"和"前天"两段，展示出的 `ts_start`~`ts_end` 会覆盖中间那段没读过的区间。精确区间存在 `summaries.coverage_json` 里。
+- **重启丢会话记忆**：agent 的多轮记忆在内存里（`InMemorySaver`），进程重启即清空；消息与总结本身不受影响（在 SQLite）。
+- **刚产生的总结要等索引器跑完那一批才可被检索**（默认 10 秒一轮，入库时会主动唤醒）。
+- **同一群内多个机器人**时，@ 别的机器人也可能触发一次总结（判定仅依据 mentions 里的 `bot` 标志位）。
+- **升级自旧版本**：向量 collection 已从 `group_messages` 改名为 `summaries`，旧向量不会被读取（也不由代码删除）。确认不需要后可以手动删掉 `data/chroma_db/` 回收空间。

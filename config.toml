@@ -1,0 +1,71 @@
+# Application configuration.
+#
+# `${VAR}` placeholders are substituted from the environment, which `.env`
+# populates at import time. A placeholder whose variable is unset is left
+# literal and surfaces as `None` on the `resolved_*` properties, so the LLM
+# client falls back to its provider default instead of sending a bogus key.
+
+[qq]
+# QQ 开放平台 → 机器人管理端 → 开发设置
+appid  = "${QQ_APPID}"
+secret = "${QQ_SECRET}"
+is_sandbox = false
+
+[llm]
+# Deliberately un-pinned: works with any OpenAI-compatible gateway.
+# Leave LLM_BASE_URL unset to target the official OpenAI endpoint.
+model      = "${LLM_MODEL}"
+base_url   = "${LLM_BASE_URL}"
+api_key    = "${LLM_API_KEY}"
+temperature = 0.3
+max_tokens  = 2048
+timeout     = 60
+
+[embedding]
+# May point at a different gateway than [llm].
+model      = "${EMBED_MODEL}"
+base_url   = "${EMBED_BASE_URL}"
+api_key    = "${EMBED_API_KEY}"
+# Conservative cap on inputs per request; the client clamps it anyway.
+batch_size = 25
+
+[store]
+sqlite_path       = "data/qqbot.db"
+chroma_path       = "data/chroma_db"
+# 存的是「总结」，不是消息。改这个名字同时也是迁移：旧的 group_messages
+# collection 里是逐条消息的向量，而私聊的检索是不带群过滤的，会把它捞出来。
+chroma_collection = "summaries"
+
+[summary]
+default_recent_n       = 200
+max_reply_chars        = 1500
+max_replies            = 5      # 官方硬上限：单条消息最多被动回复 5 次
+passive_reply_deadline_s = 270  # 距 5 分钟窗口过近时改用主动消息
+
+[auto_summary]
+# 消息攒够 min_messages 条就自动总结一次，不需要有人 @ 机器人。
+# 不想要就把 enabled 关掉。
+enabled      = true
+min_messages = 200    # 距本群上次总结累计这么多条新消息就触发
+cooldown_s   = 1800   # 两次尝试之间的最短间隔（失败也算，避免打爆网关）
+notify       = false  # true = 顺带发到群里（主动消息，吃配额，需群主开推送）
+groups       = []     # 空 = 所有群；填 group_openid 即只对这些群自动总结
+instruction  = "自动总结：请总结本群最近的讨论，按话题归类，标注发言人与时间。"
+
+[c2c]
+# 私聊检索。可以读到**所有群**的总结，以及用 messages_across_groups 读到原文
+# ——这是设计目标，不是漏洞，但也是本项目影响面最大的一项设置，
+# allowlist 就是收紧的旋钮。
+enabled   = true
+allowlist = []   # 空 = 任何人都能私聊检索；填入 user_openid 即只允许这些人
+max_groups_shown = 20
+raw_limit = 200  # 私聊取原文一次最多返回多少条
+
+[groups]
+# 可选：给群 openid 起个人话名字。检索到的总结正文与回答里会用它；
+# QQ 没有任何接口能把 group_openid 解析成群名，不配就只能显示 openid 尾号。
+# "<group_openid>" = "公司群"
+
+[logging]
+level = "INFO"
+dir   = "logs"
