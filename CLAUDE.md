@@ -10,7 +10,7 @@ QQ 群消息总结机器人：接入 QQ 官方机器人（群聊能力）接收�
 
 ## 项目现状
 
-**实现已完成（脱机可验证部分）**：脱机测试 **265 条断言**全绿。未完成的只剩真机联调（见 §五）。
+**实现已完成（脱机可验证部分）**：脱机测试 **275 条断言**全绿。未完成的只剩真机联调（见 §五）。
 
 ```mermaid
 flowchart LR
@@ -658,7 +658,7 @@ flowchart TB
 
 ## 五、待办 / 下一步
 
-**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI —— 见 §项目现状，脱机测试 **265 条断言**全绿。
+**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI —— 见 §项目现状，脱机测试 **275 条断言**全绿。
 
 **剩余（按能否脱机划分为两类）**：
 
@@ -681,7 +681,7 @@ flowchart TB
 现状：图片与语音都只是**文本占位**，没有进入语义层。
 
 - 图片在 `Attachment.label()`（`events.py:89`）里渲染成 `[图片 <filename>]`，而真机的 `filename` 是一串大写十六进制 + 扩展名（形如 `6A3051F3….jpg`），**信息量≈0**。
-- 语音取 `asr_refer_text`（QQ 侧的转写），渲染成 `[语音转写 …]`；没有转写就没有可用文本。
+- 语音取 `asr_refer_text`（官方文档名"语音消息 ASR **参考**结果"——名字本身不承诺必有），渲染成 `[语音转写 …]`；**没有转写渲染成 `[语音（无转写）]`**（M1，2026-10-09 已实现）——让摘要至少知道这里说过一次话。语音判定认 `content_type` 的 `voice` 与 `audio/*`（官方 2026-09-16 版事件页的枚举就是裸词 `voice`，同页却称该列为"MIME 类型"，图片实际以 `image/jpeg` 到线，故两边都收）；**`message_type` 不可用**——官方没有语音专属值，且官方自己的图片示例与真机库都是 `message_type: 0`。官方 MessageAttachment 另有 **`voice_wav_url`**（QQ 已完成 SILK→WAV 转换，URL 与图片同款 `rkey` 签名结构）：按"音频不入库"的取舍**不解析**，但随逐字 `raw_json` 原样保留，日后想用便宜的原生音频模型时反悔成本为零。⚠️ botpy 1.2.1 的 `_Attachments` **不解析** `asr_refer_text`（site-packages 全文零命中），所以 @ 退路上语音恒进无转写分支；`Attachment.from_object` 已按 `getattr` 读取该字段，SDK 哪天补上即自动生效。真机观察（覆盖率/长度/风格）待第一条语音落库——当前语料语音消息为 0 条（2026-10-09 清点 `data/qqbot.db`，带附件的 5 条全是图片）。多模态的完整计划（含"不存音频文件：能读音频的全模态模型太贵"这条既定取舍）见 [`ROADMAP.md`](ROADMAP.md)。
 - QQ 表情在正文里是 `<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">` 这类原始编码，未渲染。
 
 已经就位、可以直接用的东西：
