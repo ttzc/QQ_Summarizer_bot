@@ -755,6 +755,8 @@ flowchart TB
 
 `langchain-openai` **不会**自己传这个字段，所以照现在的代码跑就是"thinking 全开"。要关掉须在 `init_chat_model(...)` 的入参里加 `extra_body={"thinking": {"type": "disabled"}}`（`ChatOpenAI` 的标准参数，`init_chat_model` 会透传），位置就是 `src/api/llm_client.py:41` 的 `overrides`。
 
+> **决定（2026-10-10，用户拍板）：thinking 保持开启，不要注入 disabled。** 这是产品决定不是遗漏——不要"顺手修好"它。接受的代价：reasoning token 占 `max_tokens` 预算（截断/空内容风险），换来的是推理质量。兜底已在位：`view_image` 对空内容返回"模型对这张图没有返回内容"，总结路径靠 `storable()` 的长度门槛；`[llm].max_tokens` 若真机看到截断，调大它，而不是关思考。
+
 **③ 视觉确实通了**：64×64 纯色 PNG + `detail:"low"` → HTTP 200，`prompt_tokens=224`（图 ≈209 + 文本 15），说明图被真正解析过 —— 若模型不收图，前面在硅基流动上见过的是 `400 code=20041`。
 
 #### 5.1.2 图片拿得到吗（2026-10-09 实测，结论未完成）

@@ -441,13 +441,20 @@ async def view_image(
             f"本次回答查看图片已达上限（{config.media.max_views} 张），"
             "请基于已有信息作答。"
         )
-    ctx.views_used += 1
 
     try:
         data = await asyncio.to_thread(_read_media_file, row["path"])
     except OSError:
         logger.warning("media 文件缺失", extra={"media_id": row["media_id"], "path": row["path"]})
         return "这张图的文件缺失，看不了。"
+    # 32 MiB 是**落盘**护栏（外链下载的官方约束）；内联 base64 是另一回事——
+    # 几 MB 的 body 会被网关在传输层拒掉，每张都拒、每次扣额度、永远看不到。
+    # 所以看一遍尺寸，超限直接给明确文案，不进入调用路径。
+    if len(data) > int(config.media.max_inline_bytes):
+        return (
+            f"这张图有 {len(data) // (1 << 20)} MB，超过内联看图上限"
+            f"（{int(config.media.max_inline_bytes) // (1 << 20)} MB），看不了。"
+        )
     sniffed = sniff_image(data)
     if sniffed is None:
         return "这张图的文件内容不是可查看的图片格式。"
@@ -458,6 +465,9 @@ async def view_image(
         if focus.strip()
         else config.media.describe_prompt
     )
+    # 额度只花在**真实视觉调用**上：读盘/魔数/尺寸这些没走到模型的路径不扣——
+    # 否则一个坏文件就能把 max_views 白白吃空，把好图挤在门外。
+    ctx.views_used += 1
     try:
         answer = await describe_image(data, mime, prompt)
     except Exception as exc:  # noqa: BLE001 - 一次工具失败不拖垮整轮（同 messages_in_range 的约定）

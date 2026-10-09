@@ -31,8 +31,8 @@ stateDiagram-v2
     [*] --> pending: 带图消息落库（同步段，同事务）
     pending --> stored: 下载 + 魔数白名单 + 未超限，落盘完成
     pending --> expired: 下载 4xx（签名失效）
-    pending --> skipped: 魔数不在白名单 / 超 max_bytes
-    pending --> failed: 网络/5xx 且 attempts ≥ attempts_max
+    pending --> skipped: 超 max_bytes（event_size 预判或真实字节，确定性拒绝）
+    pending --> failed: 网络/5xx 或 200 但字节非图片（疑似 CDN 错误页），attempts 用尽
     stored --> stored: view_image 按需调用（不改状态，只填 description）
 ```
 
@@ -90,7 +90,8 @@ async def view_image(
 enabled             = true
 dir                 = "data/media"   # 根目录；内部按消息发送日期自动分桶 data/media/YYYY-MM-DD/
 batch               = 10
-max_bytes           = 33554432       # 32 MiB；先按 event_size 预判，落盘前按真实字节复核
+max_bytes           = 33554432       # 32 MiB；落盘护栏（event_size 预判 + 真实字节复核）
+max_inline_bytes    = 4194304        # 4 MiB；view_image 内联 base64 护栏——两条线用途不同
 attempts_max        = 3
 download_timeout_s  = 30
 interval_s          = 15
@@ -119,15 +120,21 @@ detail              = "low"          # 看图调用一律缩到 512×512，摘�
 2. Worker 成功路径：pending → stored；`data/media/<消息发送日期>/<sha256>.<ext>` 存在（跨天重试仍落回原日期桶）。
 3. 全局去重：两个消息同一张图 → 一个文件（**分属不同日期桶时同样复用旧 path**）、两行 media、各自可被查看。
 4. 4xx → expired 不再被拾取；5xx → attempts 累加到上限转 failed；`enabled=false` → 只攒行不处理。
-5. 魔数不在白名单（如 `%PDF` 头）→ skipped，占位改注格式不支持。
-6. 超 `max_bytes` → skipped（`event_size` 预判与真实字节复核两条路径各测一次）。
+5. **200 但字节魔数不过** → 按可重试走（CDN 对过期签名常回 200+错误页，不能当场判死）；attempts 用尽转 `failed`，且 `last_error` 保留技术原因不被展示文案覆盖。`skipped` 只属于确定性拒绝。
+6. 超 `max_bytes` → skipped（`event_size` 预判与真实字节复核两条路径各测一次）；`view_image` 侧超 `max_inline_bytes` 有独立的明确文案。
 7. `view_image` 端到端（真 ToolNode 注入）：短 id 解析、缓存命中零调用、无 focus 时描述回写 `description`+`content`（幂等——第二次回写不重复替换）、带 focus 不落缓存。
 8. 群校验：G_demo 的运行拿 G_other 的短 id → 拒绝文本；私聊 scope 同 id → 放行。
 9. `describe` 抛异常 → 工具返回可读错误文本，agent 运行不中断。
-10. `max_views` 限流：第 7 次调用返回上限提示，`describe` 只被调 6 次。
-11. `view_image` 不在 `DATA_TOOLS`：仅调过 view_image 的回答 `storable()` 判定不受影响（更新 `test_agent.py` 的工具集断言：群与私聊各 5 个）。
+10. `max_views` 限流：第 7 次调用返回上限提示，`describe` 只被调 6 次。**额度只扣在真实视觉调用**上——文件缺失、超内联上限这些没走到模型的路径不扣；ref 带空格或 `#`（从占位符直接截取的 `" #4d9f…"`）同样能解析。
+11. 启动时清扫孤儿 `.{sha}.ext.tmp`（上一次进程在 write 与 rename 之间被杀留下的半文件），只清 tmp 不碰成品。
+12. `view_image` 不在 `DATA_TOOLS`：仅调过 view_image 的回答 `storable()` 判定不受影响（`test_agent.py` 的工具集断言：群与私聊各 5 个）。
 
 真机项：第一条真实图片 pending→stored；一次 @ 总结中模型主动调 `view_image` 的全链路；隔天重放验证离线积压场景（决定 expired 是否需要人工重放命令）。
+
+## 已知边界（M2 首版，code-review 2026-10-10 确认）
+
+- **引用/合并转发里的图片不入队列**：`media` 行的生成只遍历顶层 `rec.attachments`；`msg_elements` 嵌套附件的标签会被 `render()` 渲进正文、但没有 `#短id`，因此不可查看。§2.7 的"一次附件出现一行"目前只对顶层成立。转发聊天记录带截图在 QQ 很常见——列为 M2.x，修法是把 id 注入 `MsgElement.render` 的锚点链路。
+- **thinking 保持开启（已决定，勿"修"）**：DeepSeek 官方默认开思考，reasoning token 计入 `max_tokens`；`view_image` 的一次性调用若被推理吃光预算返回空串，工具如实报"模型对这张图没有返回内容"。2026-10-10 用户拍板**接受这个代价换推理质量**，不注入 `extra_body={"thinking":{"type":"disabled"}}`（详见 CLAUDE.md §5.1.1.2 的决定块）。若真机出现截断，处置是调大 `[llm].max_tokens`，不是关思考。
 
 ## M2.5（可选升级，本期不做）
 

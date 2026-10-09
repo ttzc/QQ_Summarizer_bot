@@ -329,8 +329,19 @@ class SQLStore:
                 (error[:200], _now(), media_id),
             )
 
-    def note_media_failure(self, media_id: str, status: str, note: str | None = None) -> None:
+    def note_media_failure(
+        self,
+        media_id: str,
+        status: str,
+        note: str | None = None,
+        error: str | None = None,
+    ) -> None:
         """终态（expired / skipped / failed），并把可见说明换进消息正文。
+
+        `note` 是给模型看的正文文案；`error` 是给 `qqbot media` 看的技术原因。
+        不传 `error` 时**保留** `last_error` 原值——重试耗尽转 failed 的行，
+        早先 `bump_media_attempt` 记下的 `HTTP 503` / 连接异常正是排查要的，
+        不能让展示文案把它覆盖掉。
 
         取数里写明这张图看不了，模型就不会去调一个必然失败的工具。`replace()`
         会替换**所有**相同标签——同一消息里两张同名图同归于此，罕见且可接受。
@@ -339,10 +350,16 @@ class SQLStore:
             "SELECT message_id, placeholder FROM media WHERE media_id = ?", (media_id,)
         ).fetchone()
         with self._conn:
-            self._conn.execute(
-                "UPDATE media SET status=?, last_error=?, updated_at=? WHERE media_id=?",
-                (status, (note or "")[:200] or None, _now(), media_id),
-            )
+            if error is not None:
+                self._conn.execute(
+                    "UPDATE media SET status=?, last_error=?, updated_at=? WHERE media_id=?",
+                    (status, error[:200], _now(), media_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE media SET status=?, updated_at=? WHERE media_id=?",
+                    (status, _now(), media_id),
+                )
             if row is not None and note:
                 self._conn.execute(
                     "UPDATE group_messages SET content = replace(content, ?, ?) WHERE message_id=?",
@@ -355,7 +372,7 @@ class SQLStore:
         至少 6 位的要求是**准确性**护栏（短前缀撞库），不是安全护栏；真正的
         安全是 `view_image` 拿着行做群校验。
         """
-        ref = (ref or "").lstrip("#").strip().lower()
+        ref = (ref or "").strip().lstrip("#").strip().lower()
         if len(ref) < 6 or not all(c in "0123456789abcdef" for c in ref):
             return None
         cursor = self._conn.execute(

@@ -39,7 +39,12 @@ async def describe_image(data: bytes, mime: str, prompt: str) -> str:
 
 
 def _text_of(content: Any) -> str:
-    """message content 可能是 str 或 block 列表，统一压成文本。"""
+    """message content 可能是 str 或 block 列表，统一压成文本。
+
+    与 `src/agent/summarizer.py` 里的同名函数刻意各自一份：summarizer 在
+    `tools.py` 的上游（summarizer → tools → vision），vision 若反向 import 它
+    就构成循环。两处逻辑都只有几行，复制的成本低于解开这条依赖链。
+    """
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):

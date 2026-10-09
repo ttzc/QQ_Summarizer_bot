@@ -175,7 +175,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
 CREATE INDEX idx_media_pending ON media(status, created_at) WHERE status = 'pending';  -- Worker 取队
 ```
 
-**写路径**：`SQLStore.insert_messages()` 在插入消息的**同一事务**里，为图片形态的附件（`Attachment.is_voice()` 同理的 `content_type` 判定）插 media 行，并把该消息 `content` 里的占位换成带短 id 的版本。去重免费——重复事件时消息本体 `INSERT OR IGNORE` 插不进，media 分支根本不执行。`§2.2` 的 `has_media` 从此与"media 表有行"等价，保留它只为不查表就能过滤。
+**写路径**：`SQLStore.insert_messages()` 在插入消息的**同一事务**里，为图片形态的附件（`Attachment.is_image()` 的 `content_type` 判定）插 media 行，并把该消息 `content` 里的占位换成带短 id 的版本。去重免费——重复事件时消息本体 `INSERT OR IGNORE` 插不进，media 分支根本不执行。`§2.2` 的 `has_media` 从此与"media 表有行"**近似**等价（保留它只为不查表就能过滤）：说"近似"是因为目前只有**顶层**附件会建行，`msg_elements` 里嵌套的图片暂不入列（MEDIA.md 已知边界，M2.x）。
 
 **一条存了图的消息，三跳找到自己的图**：
 

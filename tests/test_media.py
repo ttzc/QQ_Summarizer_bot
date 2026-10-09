@@ -159,6 +159,7 @@ async def test_worker_expired_and_retry_policy(store, media_dir) -> None:
     assert await worker.process_once() == 0
     row = store.media_rows("expired")[0]
     assert row["path"] is None, "expired 没有落盘"
+    assert row["last_error"] == "HTTP 404", "技术原因入库（qqbot media 可查）"
     assert await worker.process_once() == 0 and store.pending_media(10) == []
 
     content = store.recent_messages("G_demo", 10)[0]["content"]
@@ -175,12 +176,29 @@ async def test_worker_expired_and_retry_policy(store, media_dir) -> None:
     assert store.media_rows("failed"), "attempts 用尽转 failed 终态"
 
 
-async def test_worker_skips_format_and_size(store, media_dir) -> None:
+async def test_worker_non_image_body_retries_then_failed(store, media_dir) -> None:
+    # code-review F5：CDN 对过期签名常回 200 + 错误页。字节不是图片时**不能**
+    # 当场判死（skipped 是终态，会永久丢图），要按可重试收敛。
     store.insert_messages([GroupMessageRecord.from_payload(frame(IMAGE_MESSAGE, "E1"))])
-    worker = MediaWorker(store, http_get=make_http(data=NOT_IMAGE))
+    worker = MediaWorker(store, http_get=make_http(data=NOT_IMAGE), attempts_max=2)
     await worker.process_once()
-    assert store.media_rows("skipped"), "魔数不在白名单 → skipped"
-    assert store.pending_media(10) == [], "skipped 不重试，也不耗任何 LLM"
+    assert store.pending_media(10), "200+非图片 → 可重试，仍在队列"
+    await worker.process_once()
+    failed = store.media_rows("failed")
+    assert failed, "attempts 用尽转 failed 终态"
+    assert "whitelisted" in (failed[0]["last_error"] or ""), (
+        "技术原因不被展示文案覆盖（code-review F8）"
+    )
+    content = store.recent_messages("G_demo", 10)[0]["content"]
+    assert "抓取失败" in content
+
+    # skipped 现在只属于尺寸超限这类确定性拒绝。
+    store.insert_messages(
+        [GroupMessageRecord.from_payload(frame({**IMAGE_MESSAGE, "id": "IMG_OVER"}, "E9"))]
+    )
+    worker2 = MediaWorker(store, http_get=make_http(data=JPEG_BYTES * 10), max_bytes=64)
+    await worker2.process_once()
+    assert store.media_rows("skipped"), "真实字节超限 → skipped（确定性，不重试）"
 
     # event_size 预判：超限直接跳过，连下载都不发生。
     big = {
@@ -205,6 +223,21 @@ async def test_worker_skips_format_and_size(store, media_dir) -> None:
     worker3 = MediaWorker(store, http_get=make_http(data=JPEG_BYTES * 10), max_bytes=64)
     await worker3.process_once()
     assert store.pending_media(10) == []
+
+
+async def test_startup_sweep_removes_orphan_tmp(store, media_dir) -> None:
+    # code-review F10：write 与 rename 之间被杀留下的 `.{sha}.ext.tmp`，只有
+    # 启动清扫一条路——本进程开跑时目录里的每个 tmp 都来自已死的进程。
+    bucket = media_dir / "2026-10-09"
+    bucket.mkdir(parents=True)
+    orphan = bucket / ".deadbeef.jpg.tmp"
+    orphan.write_bytes(b"half-written")
+    keeper = bucket / "real.jpg"
+    keeper.write_bytes(b"keep me")
+
+    worker = MediaWorker(store, http_get=make_http())
+    assert worker._sweep_tmp() == 1, "孤儿 tmp 被清"
+    assert not orphan.exists() and keeper.exists(), "只清 tmp，不碰成品文件"
 
 
 def test_sniff_whitelist() -> None:
@@ -310,6 +343,44 @@ async def test_view_image_limit_and_failure(store, media_dir, monkeypatch) -> No
     )
     err = await view_image.coroutine(media_ref=shorts[1], runtime=boom)
     assert "看不了" in err and "gateway down" in err
+
+
+async def test_view_image_ref_normalization(store, media_dir, monkeypatch) -> None:
+    # code-review F1：模型从 `[图片 xx.jpg #4d9f]` 里截取时经常带上空格或 #，
+    # 归一化顺序错了就会对着一个合法 id 报"找不到"，白烧几轮递归。
+    await _store_one_image(store, make_http())
+    fake = make_describe()
+    monkeypatch.setattr("src.agent.tools.describe_image", fake)
+    short = store.media_rows("stored")[0]["media_id"][:8]
+
+    first = await view_image.coroutine(media_ref=f" #{short}", runtime=_RT("G_demo", store=store))
+    assert first.startswith("[图片描述]"), "带空格/井号的 ref 能解析（真实调用发生）"
+    assert fake.calls["count"] == 1
+    for ref in (f"#{short}", f"  {short}  ", short):
+        out = await view_image.coroutine(media_ref=ref, runtime=_RT("G_demo", store=store))
+        assert out.startswith("[图片描述]"), f"ref={ref!r} 应命中"
+    assert fake.calls["count"] == 1, "其余三次都吃缓存，不再调模型"
+
+
+async def test_view_image_no_quota_for_no_call_paths(store, media_dir, monkeypatch) -> None:
+    await _store_one_image(store, make_http())
+    monkeypatch.setattr("src.agent.tools.describe_image", make_describe())
+    row = store.media_rows("stored")[0]
+    short = row["media_id"][:8]
+    file = media_dir / row["path"]
+
+    # ① 文件缺失（如磁盘手工清理过）：没走到模型，不该吃 max_views（F4）。
+    file.unlink()
+    ctx = _RT("G_demo", store=store)
+    out = await view_image.coroutine(media_ref=short, runtime=ctx)
+    assert "缺失" in out and ctx.context.views_used == 0, "文件缺失不花真实调用额度"
+
+    # ② 文件在但超过内联上限（F7）：明确文案拒绝，同样不占额度、不碰模型。
+    file.write_bytes(JPEG_BYTES)
+    monkeypatch.setattr(config.media, "max_inline_bytes", 16)
+    ctx2 = _RT("G_demo", store=store)
+    out2 = await view_image.coroutine(media_ref=short, runtime=ctx2)
+    assert "内联看图上限" in out2 and ctx2.context.views_used == 0, "超限不调模型也不扣额度"
 
 
 def test_view_image_not_a_data_tool() -> None:

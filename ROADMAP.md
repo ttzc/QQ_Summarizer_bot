@@ -51,6 +51,12 @@
 - [ ] 真机：第一条真实图片 pending→stored；一次 @ 总结中模型主动 `view_image` 的全链路；隔天重放验证离线积压场景（决定 expired 要不要配人工重放）。
 - 不做（本期）：图片进向量库、图搜图；把图块塞进 agent 循环反复放大看像素 → **M2.5** 保留选项（机制代价清单在 MEDIA.md 末节，触发条件出现再立项；与 `view_image` 缓存语义兼容，只加不减）。
 
+### M2.x · 首版边界（2026-10-10 code-review 挂账）
+
+- [ ] **嵌套图片**：引用/合并转发（`msg_elements`）里的图片附件目前不入队列——标签渲进正文但没有 `#短id`，不可查看。修法是让 `MsgElement.render` 的锚点也走 id 注入链。
+- ~~全局关 thinking~~ —— **已决定不做（2026-10-10）**：thinking 保持开启，接受 reasoning 占预算的代价。真机若出现截断，调大 `[llm].max_tokens` 而不是关思考（决定记录：CLAUDE.md §5.1.1.2）。
+- [ ] `expired` 的人工重放命令：等 §五 真机观察（离线积压一晚的 pending 还能不能下载）出结论再定。
+
 ### M3 · PDF 转图
 
 PDF 是 `Attachment(content_type="application/pdf")`，同样先进 `media` 表（M2 的表扩一个文件形态分支即可，见 MEDIA.md），只是处理管线多一步：

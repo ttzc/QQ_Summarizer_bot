@@ -219,6 +219,10 @@ class MediaConfig(BaseModel):
     dir: str = "data/media"          # 根目录；内部按消息发送日期分桶 YYYY-MM-DD/
     batch: int = 10                  # Worker 每批处理的 pending 行数
     max_bytes: int = 33_554_432      # 32 MiB；先按 event_size 预判，下载后按真实字节复核
+    # view_image 内联 base64 的尺寸上限。与 max_bytes 是两条线：32 MiB 是"值得
+    # 存"的下限护栏，这个是"发得出去"的上限护栏——base64 膨胀 ~33%，几 MB 的
+    # body 会被网关直接拒，且每张被拒的图都白扣一次 max_views。
+    max_inline_bytes: int = 4_194_304
     attempts_max: int = 3            # 网络/5xx 重试上限，超过转 failed
     download_timeout_s: int = 30
     interval_s: int = 15             # 无唤醒时的兜底轮询间隔
