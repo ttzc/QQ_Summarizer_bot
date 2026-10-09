@@ -18,10 +18,12 @@ from typing import Any
 # arbitrarily deep; cap it so a hostile payload cannot blow the stack.
 MAX_ELEMENT_DEPTH = 5
 
+# Voice is not listed: it is decided by `Attachment.is_voice()` before this
+# table is consulted, because "no transcription" must render differently from
+# "some other attachment".
 _KIND_BY_PREFIX: tuple[tuple[str, str], ...] = (
     ("image/", "图片"),
     ("video/", "视频"),
-    ("voice", "语音"),
     ("file", "文件"),
 )
 
@@ -60,7 +62,14 @@ class Attachment:
     size: int | None = None
     width: int | None = None
     height: int | None = None
-    asr_refer_text: str | None = None  # voice messages carry an ASR transcript
+    # Official docs (GROUP_MESSAGE_CREATE, MessageAttachment): `asr_refer_text`
+    # 是"语音消息 ASR **参考**结果" — the wording itself promises nothing, so
+    # absence is a normal state, hence the explicit no-transcript placeholder in
+    # `label()`. The docs also deliver `voice_wav_url` (SILK→WAV conversion by
+    # QQ, same `rkey`-signed URL shape as images); deliberately *not* parsed —
+    # audio stays out of scope (ROADMAP M1), and the whole payload persists in
+    # `raw_json` regardless, so the field is never lost, just unread.
+    asr_refer_text: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "Attachment":
@@ -84,12 +93,38 @@ class Attachment:
             size=getattr(obj, "size", None),
             width=getattr(obj, "width", None),
             height=getattr(obj, "height", None),
+            # botpy 1.2.1's `_Attachments` does not parse `asr_refer_text` at
+            # all (verified: the string appears nowhere in the package), so on
+            # the @-fallback path a voice message always shows "no
+            # transcription". Read it anyway: the moment an SDK release adds
+            # the field, transcripts start flowing without touching this file.
+            asr_refer_text=getattr(obj, "asr_refer_text", None),
         )
+
+    def is_voice(self) -> bool:
+        """Whether this attachment is a voice message.
+
+        Detection is `content_type`-driven, never `message_type`-driven: the
+        official docs enumerate `content_type` as `voice` / `image/jpeg` /
+        `image/png` / `image/gif` / `video/mp4` / `file` (bare `voice`, despite
+        the column being called "MIME 类型"), and their own example — like the
+        real corpus — tags an image message `message_type: 0`. Bare `voice` is
+        the documented spelling; `audio/…` is accepted defensively because the
+        same docs *do* deliver MIME spellings for images on the wire.
+        """
+        ct = (self.content_type or "").lower()
+        return ct.startswith("voice") or ct.startswith("audio")
 
     def label(self) -> str:
         """Compact stand-in for the attachment, e.g. ``[图片 photo.jpg]``."""
         if self.asr_refer_text:
             return f"[语音转写 {self.asr_refer_text}]"
+        if self.is_voice():
+            # QQ gave no transcript. The filename is a hex ID carrying no
+            # signal, so say plainly "voice, nothing recovered" — a summariser
+            # reading `[语音（无转写）]` at least knows someone spoke there,
+            # instead of the turn quietly vanishing from the digest.
+            return "[语音（无转写）]"
         kind = "附件"
         for prefix, name in _KIND_BY_PREFIX:
             if (self.content_type or "").startswith(prefix):

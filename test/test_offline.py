@@ -31,7 +31,7 @@ from botpy.errors import SequenceNumberError  # noqa: E402
 
 from src.agent.summarizer import SummaryResult  # noqa: E402
 from src.agent.tools import CoverageLog  # noqa: E402
-from src.bot.events import MAX_ELEMENT_DEPTH, GroupMessageRecord  # noqa: E402
+from src.bot.events import MAX_ELEMENT_DEPTH, Attachment, GroupMessageRecord  # noqa: E402
 from src.bot.sender import KIND_C2C, plan_chunks, reply_chunked  # noqa: E402
 from src.config import config  # noqa: E402
 from src.store.sql_store import SQLStore  # noqa: E402
@@ -113,6 +113,40 @@ IMAGE_MESSAGE = {
     ],
 }
 
+# Shape taken from the official GROUP_MESSAGE_CREATE docs (MessageAttachment
+# table, updated 2026-09-16): voice attachments carry the *bare*
+# `content_type: "voice"` plus `asr_refer_text` ("ASR 参考结果" — non-committal
+# by name) and `voice_wav_url` (QQ 已做 SILK→WAV 转换). There is no voice-specific
+# `message_type` — the docs' own image example is `message_type: 0`, matching
+# the real corpus — so detection must read `content_type`. `voice_wav_url` is
+# deliberately not parsed (audio out of scope, ROADMAP M1); it still survives
+# in `raw_json`, and the assertion below pins that ignoring it changes nothing.
+VOICE_MESSAGE = {
+    "id": "ROBOT1.0_voice",
+    "author": {
+        "id": "U1",
+        "username": "小明",
+        "bot": False,
+        "member_openid": "M_ming",
+        "member_role": "member",
+    },
+    "content": " ",
+    "group_openid": "G_demo",
+    "message_type": 0,
+    "timestamp": "2026-07-21T08:30:00+08:00",
+    "message_scene": {"source": "default", "ext": ["msg_idx=REFIDX_voice=="]},
+    "attachments": [
+        {
+            "content_type": "voice",
+            "filename": "6A3051F3A1B2C3D4.silk",
+            "url": "https://multimedia.nt.qq.com.cn/download?appid=xxx&fileid=xxx&rkey=xxx&spec=0",
+            "voice_wav_url": "https://multimedia.nt.qq.com.cn/download?appid=xxx&fileid=wav&rkey=xxx&spec=0",
+            "size": 20480,
+            "asr_refer_text": "明天下午三点记得交周报",
+        }
+    ],
+}
+
 QUOTE_MESSAGE = {
     "id": "ROBOT1.0_quote",
     "author": {
@@ -186,6 +220,54 @@ def test_image_message() -> None:
     check("群主角色", rec.member_role == "owner", str(rec.member_role))
 
 
+def test_voice_message() -> None:
+    print("\n[2b] 语音消息（ASR 转写 / 无转写占位）")
+    rec = GroupMessageRecord.from_payload(frame(VOICE_MESSAGE))
+    att = rec.attachments[0]
+    check("官方写法 content_type=voice 被识别为语音", att.is_voice())
+    check("转写进 label", att.label() == "[语音转写 明天下午三点记得交周报]", att.label())
+    # 顶部 content 是空白 —— 转写就是这条消息的正文全部（同引用消息的处境）。
+    check("正文即转写", rec.body() == "[语音转写 明天下午三点记得交周报]", repr(rec.body()))
+    check("to_line 保留转写", "明天下午三点记得交周报" in rec.to_line(), rec.to_line())
+    # 官方还有个 voice_wav_url（QQ 已把 SILK 转成 WAV）。音频不在范围内（M1 取舍），
+    # 所以不解析 —— 但逐字 raw 必须原样保留，日后改主意时字段还在。
+    check("voice_wav_url 不进渲染", "wav" not in rec.body(), repr(rec.body()))
+    check("voice_wav_url 留在 raw 里没丢", rec.raw["attachments"][0]["voice_wav_url"].startswith("https://"))
+
+    # 真机落库的附件是 MIME 形态（图片以 image/jpeg 下发），语音可能同样以
+    # audio/… 出现，两种写法都要认。
+    mime = {
+        **VOICE_MESSAGE,
+        "attachments": [{**VOICE_MESSAGE["attachments"][0], "content_type": "audio/amr"}],
+    }
+    check("audio/ 形态也识别为语音", GroupMessageRecord.from_payload(frame(mime)).attachments[0].is_voice())
+
+    # 无转写：用明确占位告诉摘要"这里说过话、但没听清"，而不是让这一轮发言
+    # 从摘要里悄悄消失。文件名是十六进制串，没有信息量，不进 label。
+    silent_att = {k: v for k, v in VOICE_MESSAGE["attachments"][0].items() if k != "asr_refer_text"}
+    silent = {**VOICE_MESSAGE, "id": "ROBOT1.0_voice_noasr", "attachments": [silent_att]}
+    rec2 = GroupMessageRecord.from_payload(frame(silent))
+    check("无转写时占位且不带文件名", rec2.body() == "[语音（无转写）]", repr(rec2.body()))
+
+    # @ 退路：botpy 1.2.1 的 `_Attachments` 根本不解析 asr_refer_text
+    # （site-packages 全文零命中），所以那条路上 getattr 恒为 None、只会落进
+    # 无转写占位。from_object 仍要把它读上——SDK 哪天补了这个字段就自动生效。
+    class _BotpyAtt:
+        content_type = "voice"
+        filename = "6A3051F3.silk"
+        url = "https://u"
+        size = 10
+        width = None
+        height = None
+        asr_refer_text = "未来 SDK 会透传的转写"
+
+    check(
+        "from_object 在 SDK 提供 asr_refer_text 时透传",
+        Attachment.from_object(_BotpyAtt()).label() == "[语音转写 未来 SDK 会透传的转写]",
+        Attachment.from_object(_BotpyAtt()).label(),
+    )
+
+
 def test_quote_message() -> None:
     print("\n[3] 引用/嵌套消息（content 为空白）")
     rec = GroupMessageRecord.from_payload(frame(QUOTE_MESSAGE))
@@ -232,14 +314,15 @@ def test_store() -> None:
             GroupMessageRecord.from_payload(frame(TEXT_MESSAGE, "E1")),
             GroupMessageRecord.from_payload(frame(IMAGE_MESSAGE, "E2")),
             GroupMessageRecord.from_payload(frame(QUOTE_MESSAGE, "E3")),
+            GroupMessageRecord.from_payload(frame(VOICE_MESSAGE, "E4")),
         ]
-        check("首次写入 3 条", store.insert_messages(recs) == 3)
+        check("首次写入 4 条", store.insert_messages(recs) == 4)
 
         # 同一条消息被 QQ 重复推送时不应重复入库
         check("重复写入被去重", store.insert_messages(recs) == 0)
 
         recent = store.recent_messages("G_demo", limit=10)
-        check("取回 3 条且按时间正序", len(recent) == 3 and recent[0]["author_name"] == "小明")
+        check("取回 4 条且按时间正序", len(recent) == 4 and recent[0]["author_name"] == "小明")
 
         # 落库的是「文本化」的正文，不是原始 content：引用消息的原始 content 是
         # 空白、图片消息的文字全在附件上，直接存原始值会让这些消息在 prompt 里
@@ -254,6 +337,11 @@ def test_store() -> None:
             "引用消息的引用正文落库",
             "明天有空吗" in by_id["ROBOT1.0_quote"]["content"],
             by_id["ROBOT1.0_quote"]["content"],
+        )
+        check(
+            "语音消息的 ASR 转写落库",
+            "[语音转写" in by_id["ROBOT1.0_voice"]["content"],
+            by_id["ROBOT1.0_voice"]["content"],
         )
         check(
             "原文仍保留在 raw_json",
@@ -311,8 +399,8 @@ def test_store() -> None:
 
         stats = store.stats()
         check(
-            "统计 total=3 summaries=2 indexed=0（标记刚被清空）",
-            stats[0]["total"] == 3 and stats[0]["summaries"] == 2 and stats[0]["indexed"] == 0,
+            "统计 total=4 summaries=2 indexed=0（标记刚被清空）",
+            stats[0]["total"] == 4 and stats[0]["summaries"] == 2 and stats[0]["indexed"] == 0,
             str(dict(stats[0])),
         )
         check("不带群过滤能看到所有总结", len(store.summaries_for(None)) == 2)
@@ -1651,6 +1739,7 @@ if __name__ == "__main__":
     test_text_message()
     test_mentions()
     test_image_message()
+    test_voice_message()
     test_quote_message()
     test_depth_guard()
     test_bad_timestamp()
