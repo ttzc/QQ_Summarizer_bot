@@ -276,7 +276,7 @@ async def _bot_login(self, token) -> None:
 
 **决策**：`group_openid` 不进入工具的 schema，而是通过 `ToolRuntime` 注入；agent 每轮 `ainvoke` 时传入对应的 `BotContext`。
 
-**这不是约定，是工具链强制的**：LangGraph 的 `tool_node` 在执行前会剥掉模型塞进 args 里的注入参数值，换成可信来源的值。因此提示注入**无法**伪造 `group_openid`，也无法伪造 `scope`。`test/test_offline.py` 的 `test_agent_boundary` 就是构造一个同时伪造 `runtime` / `scope` / `group_openid` 的 tool call，断言检索结果仍然只来自注入的那个群——这是"跨群过滤不可被伪造"的唯一证明。
+**这不是约定，是工具链强制的**：LangGraph 的 `tool_node` 在执行前会剥掉模型塞进 args 里的注入参数值，换成可信来源的值。因此提示注入**无法**伪造 `group_openid`，也无法伪造 `scope`。`tests/test_agent.py` 的 `test_real_toolnode_keeps_search_scoped` 就是构造一个同时伪造 `runtime` / `scope` / `group_openid` 的 tool call，断言检索结果仍然只来自注入的那个群——这是"跨群过滤不可被伪造"的唯一证明。
 
 ### 4.7 为什么回复要分段、要提防窗口过期
 

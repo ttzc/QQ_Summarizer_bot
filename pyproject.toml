@@ -16,6 +16,19 @@ dependencies = [
 [project.scripts]
 qqbot = "scripts.cli:main"
 
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+# 全部为脱机测试（假模型/假 API/真 Chroma+SQLite）；异步用例直接 await，
+# 不再手写 asyncio.run 包装。
+asyncio_mode = "auto"
+
 [tool.setuptools.packages.find]
 include = ["scripts*", "src*"]
 

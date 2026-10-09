@@ -10,7 +10,7 @@ QQ 群消息总结机器人：接入 QQ 官方机器人（群聊能力）接收�
 
 ## 项目现状
 
-**实现已完成（脱机可验证部分）**：脱机测试 **275 条断言**全绿。未完成的只剩真机联调（见 §五）。
+**实现已完成（脱机可验证部分）**：脱机测试套件（pytest **39 项**，`tests/` 按主要功能分文件）全绿。未完成的只剩真机联调（见 §五）。
 
 ```mermaid
 flowchart LR
@@ -22,7 +22,7 @@ flowchart LR
     ROOT --- DOCS["docs/<br/>ARCHITECTURE.md / DATA_MODEL.md"]
     ROOT --- CLI["scripts/cli.py<br/>入口：run / stats / summaries / reindex / ask"]
     ROOT --- PROMPT["prompts/<br/>common.md + summarizer.md（群）+ c2c.md（私聊）"]
-    ROOT --- TEST["test/test_offline.py<br/>脱机验证套件（无 pytest，直接跑）"]
+    ROOT --- TEST["tests/<br/>pytest 脱机套件（每个主要功能一个文件 + conftest.py）"]
     ROOT --- SRC["src/"]
 
     SRC --- SC["config.py<br/>Pydantic 配置 + ${VAR} 展开"]
@@ -45,11 +45,11 @@ uv run qqbot stats                       # 各群消息数 / 总结数 / 已索�
 uv run qqbot summaries [--group <id>]    # 列出知识库里的总结（标明被@ / 自动）
 uv run qqbot reindex [--reset]           # 重建**总结**的向量索引
 uv run qqbot ask "总结最近 50 条" [--all] [--save]
-uv run python test/test_offline.py       # 脱机测试，期望 "全部通过"
+uv run pytest                            # 脱机测试（pytest + pytest-asyncio，全假模型/假 API/真 Chroma+SQLite）
 ```
 
 - Python `>=3.13`（`.python-version` 锁 3.13），包管理用 `uv`。
-- **无测试框架、无 lint/typecheck 配置、无 CI**：`test/test_offline.py` 是手写脚本，直接 `uv run python` 跑，没有 pytest 配置。
+- **测试用 pytest（已配置），CI 在 GitHub Actions**：`tests/` 每个主要功能一个文件——`test_events` / `test_store` / `test_sender` / `test_rag` / `test_agent` / `test_client`，共享 fixtures 与假件在 `conftest.py`；`asyncio_mode = "auto"`，dev 依赖走 `[dependency-groups]`。`.github/workflows/ci.yml` 在 push/PR 到 main 时跑 `uv sync && uv run pytest`——全套脱机，不需要任何凭据。仍**无 lint/typecheck 配置**。
 - botpy 的日志由 `setup_logger` 统一接管（`bot_log=True, ext_handlers=False`，见 §三.1）。
 
 ---
@@ -68,6 +68,7 @@ uv run python test/test_offline.py       # 脱机测试，期望 "全部通过"
 | `langchain-chroma` | 1.1.0 | 持久化向量库；拉入较重的 `chromadb` |
 | `openai` | 3.26.1 | 官方 OpenAI SDK（被 `langchain-openai` 使用） |
 | `qq-botpy` | 1.2.1 | QQ 机器人 SDK（import 名是 `botpy`） |
+| `pytest` / `pytest-asyncio` | dev 组 | 脱机套件（`tests/`，`asyncio_mode="auto"`）；CI 只跑它们 |
 
 ### ⚠️ 为什么必须装 `langchain-openai`
 
@@ -497,7 +498,7 @@ UserWarning: Pydantic serializer warnings:
 两个容易被它绕进去的点：
 
 - **功能完全正常**。校验那一侧对这两个字段足够宽松，`runtime.context` 拿到的仍是真 `BotContext`（`test_agent_boundary` 的越权断言一直是通过的），所以这是**纯 stderr 噪音**，但长得像缺陷。
-- **`_RT` 之类的替身测不出来**。直接调 `tool.coroutine(..., runtime=替身)` 会绕过 `_parse_input`，只有真的走一遍 ToolNode 才会触发。`test_offline.py` 因此把"真实注入路径不产生 pydantic 序列化告警"单独列了一条断言，并静态断言 6 个工具的 `runtime` 注解都带类型参数。
+- **`_RT` 之类的替身测不出来**。直接调 `tool.coroutine(..., runtime=替身)` 会绕过 `_parse_input`，只有真的走一遍 ToolNode 才会触发。`tests/test_agent.py` 因此把"真实注入路径不产生 pydantic 序列化告警"单独列了一项测试（`test_forged_runtime_stripped_and_no_pydantic_noise`），并静态断言 6 个工具的 `runtime` 注解都带类型参数。
 
 改法就是补上类型参数：`runtime: ToolRuntime[BotContext, dict]`。`StateT` 的默认值本来就是 `dict`，所以 `ToolRuntime[BotContext]` 也不告警；只有 `ContextT` 的默认值 `None` 会踩坑。参数化不影响注入：`_is_injected_arg_type` 认的是 `get_origin(annotation)`，订阅形式照样命中 `_DirectlyInjectedToolArg`。
 
@@ -509,7 +510,7 @@ UserWarning: Pydantic serializer warnings:
 - 因此 `tool_call_schema`（`bind_tools` 真正发给模型的那份 schema）**不含** `runtime`；而 `get_input_schema()`（完整 schema）**含** `runtime`。
   写测试断言"LLM 看不见 runtime"时，要断言 `tool_call_schema` 而不是 `get_input_schema`，否则会得到一个假失败。
 
-`test/test_offline.py` 的 `test_agent_boundary` 就是干这个的：伪造一个 `runtime: "G_other"` 塞进 tool call，断言工具读到的仍然是注入进来的那个群。
+`tests/test_agent.py` 的 `test_real_toolnode_keeps_search_scoped` 就是干这个的：伪造一个 `runtime: "G_other"` 塞进 tool call，断言工具读到的仍然是注入进来的那个群。
 
 ### 2.3 记忆 / 持久化
 
@@ -658,7 +659,7 @@ flowchart TB
 
 ## 五、待办 / 下一步
 
-**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI —— 见 §项目现状，脱机测试 **275 条断言**全绿。
+**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI —— 见 §项目现状，脱机测试（pytest **39 项**）全绿。
 
 **剩余（按能否脱机划分为两类）**：
 
@@ -789,4 +790,4 @@ https://multimedia.nt.qq.com.cn/download?appid=<QQ 侧 appid>&fileid=<密文>&rk
 
 - [x] `README.md` / `docs/ARCHITECTURE.md` / `docs/DATA_MODEL.md` 已按"一次总结一篇文档"重写。
 - [ ] `InMemorySaver` 重启即丢；要跨重启保留会话需 `uv add langgraph-checkpoint-sqlite`。
-- [ ] `src/` 模块在 **import 时**调用 `setup_logger()`（如 `src/agent/tools.py:54`），所以跑 `test/test_offline.py` 会往 `logs/app.log` 追加一堆测试日志；让日志目录可按环境变量覆盖即可解决。
+- [ ] `src/` 模块在 **import 时**调用 `setup_logger()`（如 `src/agent/tools.py:54`），所以跑 `uv run pytest` 会往 `logs/app.log` 追加一堆测试日志；让日志目录可按环境变量覆盖即可解决。

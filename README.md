@@ -167,7 +167,7 @@ flowchart LR
     ROOT --- ENVF[".env.example<br/>只放敏感凭据；入库<br/>（.env 不入库）"]
     ROOT --- PROMPT["prompts/<br/>common.md（两 scope 共用）<br/>+ summarizer.md / c2c.md"]
     ROOT --- CLI["scripts/cli.py<br/>命令行入口"]
-    ROOT --- TEST["test/test_offline.py<br/>脱机验证套件"]
+    ROOT --- TEST["tests/<br/>pytest 脱机套件（按主要功能分文件）"]
     ROOT --- DOCS["docs/<br/>架构与数据模型文档"]
     ROOT --- SRC["src/"]
 
@@ -187,10 +187,10 @@ flowchart LR
 ## 测试
 
 ```bash
-uv run python test/test_offline.py
+uv run pytest
 ```
 
-覆盖事件解析、SQLite 去重与时间范围查询、消息正文的文本化落库、总结入库与索引、回复分段（群 + 私聊）、agent 工具边界与跨群可见性（含伪造 `runtime`/`scope` 的越权尝试）、语音消息的 ASR 转写与无转写占位、以及自动总结的阈值 / 冷却 / 静默与通知 / 同群串行等 **275 条断言**，全部脱机运行，不需要任何凭据。
+覆盖事件解析、SQLite 去重与时间范围查询、消息正文的文本化落库、总结入库与索引、回复分段（群 + 私聊）、agent 工具边界与跨群可见性（含伪造 `runtime`/`scope` 的越权尝试）、语音消息的 ASR 转写与无转写占位、以及自动总结的阈值 / 冷却 / 静默与通知 / 同群串行等 **39 项测试**，按主要功能分成 `tests/` 下六个文件（共享 fixtures 与假件在 `conftest.py`），全部脱机运行，不需要任何凭据；push / PR 到 main 由 GitHub Actions（`.github/workflows/ci.yml`）自动跑同一套。
 
 ---
 
