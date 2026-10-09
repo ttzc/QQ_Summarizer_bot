@@ -689,33 +689,46 @@ flowchart TB
 - `Attachment`（`events.py:56`）已经解析并**持久化** `url` / `filename` / `content_type` / `size` / `width` / `height`，逐字原文在 `raw_json` 里 —— **图片 URL 本来就在库里，只是没人读**（实测 `content_type=image/jpeg`、`width=196`、`height=231`）。
 - `[embedding].model` 现在填的就是 VL 模型；但目前只有**总结文本**进向量库，图片本身不入库。
 
-#### 5.1.1 选哪个模型（2026-10-09 实测）
+#### 5.1.1 选哪个模型（2026-10-09 定案：全换 DeepSeek 官方 V4.1 Flash）
 
-**当前配置的 `deepseek-ai/DeepSeek-V4-Flash` 是纯文本模型，不吃图片。** 网关自己会拒掉：
+**结论：整个 `[llm]` 换到 DeepSeek 官方，模型用 `deepseek-flash`（= DeepSeek-V4.1-Flash）。** 它**一个模型同时管文本和视觉**，所以**不需要**再加 `[vision]` 段。
 
-```
-POST /v1/chat/completions    （content 里带 image_url）
-→ HTTP 400 {"code":20041,"message":"The model is not a VLM (Vision Language Model). Please use text-only prompts."}
-```
+官方定价页（`api-docs.deepseek.com/quick_start/pricing`）上只有两个模型：
 
-**DeepSeek 的视觉版不在国内站。** `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` 确实存在（SiliconFlow 国际站 `siliconflow.com` 上有模型页：原生支持 JPEG/PNG/GIF/WebP、**图片只允许放在 user message**、每张图最多按 384 tokens 计费、1M 上下文），但在 `api.siliconflow.cn` 上直接是：
+| 模型 ID | 版本 | 视觉 | 上下文 | 输入（非高峰/高峰） | 输出（非高峰/高峰） |
+|:---|:---|:---:|:---|:---|:---|
+| **`deepseek-flash`** | DeepSeek-V4.1-Flash | ✅ | 1M | $0.15 / $0.30 | $0.60 / $1.20 |
+| `deepseek-v4-pro` | DeepSeek-V4-Pro-0813 | ❌ | 1M | $0.66 / $1.32 | $1.98 / $3.96 |
 
-```
-→ HTTP 400 {"code":20012,"message":"Model does not exist. Please check it carefully."}
-```
+每百万 token。高峰 = 周一至周五 UTC 01:00–04:00 与 06:00–10:00，其余时段与周末半价。`deepseek-v4-pro` 也在分批退役：北京时间 2026-09-14 12:00 后请求全部转到 V4.1 Flash。
 
-拉一遍 `GET /v1/models`（98 个条目）可确认：**国内站没有任何 DeepSeek 视觉对话模型**。唯一的 `deepseek-ai/DeepSeek-OCR` 是文档 OCR，不是通用视觉模型 —— 拿一张纯色图喂它，它吐了一串并不存在的"购物保障 / 正品保证"广告词，纯幻觉，**不能当视觉模型用**。
+**为什么不需要拆成两个模型**：V4.1 Flash（2026-09-10 上线）是**原生多模态** —— 552B MoE、Causal-Encoder-Decoder 非对称结构（输入激活 8B / 输出 16B）、视觉编码器是从零训练的 DeepSeek-ViT，图像从一开始就在 45T token 的预训练语料里；官方称文本能力与 V4-Flash 持平。同时 `deepseek-v4-flash` 与 `deepseek-v4-flash-vision-exp` **两个旧 ID 都已退役**，仅为兼容继续路由到 V4.1 Flash 并按 Flash 价计费。**旧阵容里"文本走稳定版、图片走 `-exp`"的拆分已经不存在了。**
 
-**好消息：不用换网关。** 同一个 key、同一个 `base_url`，Qwen3-VL 系列就能用：
+**排查时实测到的现象（别重复踩）**：
 
-```
-POST /v1/chat/completions  model=Qwen/Qwen3-VL-8B-Instruct  （64×64 纯红图 + "这张图主要是什么颜色？"）
-→ 200 "红色"
-```
+| 现象 | 原因 |
+|:---|:---|
+| 当前配置的 `deepseek-ai/DeepSeek-V4-Flash`（硅基流动）带 `image_url` → `HTTP 400 code=20041 "The model is not a VLM (Vision Language Model)"` | 它确实是纯文本模型 |
+| `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` → `HTTP 400 code=20012 "Model does not exist"` | **硅基流动国内站没有 4.1**：`GET /v1/models` 全量 98 条里含 `"4.1"` 的条目 = 0，DeepSeek 系最高只到 `DeepSeek-V4-Pro` |
+| `deepseek-ai/DeepSeek-OCR` 能收图 | 但它是**文档 OCR**。喂一张纯色图，它吐出一串并不存在的"购物保障 / 正品保证"广告词，纯幻觉，**不能当视觉模型用** |
+| 同一站上 `Qwen/Qwen3-VL-8B-Instruct` 收 64×64 纯红图 → 答"红色" | 国内站有 Qwen3-VL 全家族（8B / 30B-A3B / 32B × Instruct / Thinking）。**留作备选**：不想上第二个供应商时这条路是通的 |
 
-国内站上可选的视觉模型：`Qwen/Qwen3-VL-8B-Instruct` / `-Thinking`、`Qwen/Qwen3-VL-30B-A3B-Instruct` / `-Thinking`、`Qwen/Qwen3-VL-32B-Instruct` / `-Thinking`，另有 `PaddlePaddle/PaddleOCR-VL-1.5`（偏文档解析）。与 embedding 现在用的 `Qwen/Qwen3-VL-Embedding-8B` 同门。
+**两个报错码记住**：`20041` = 模型不是 VLM（模型选错了）；`20012` = 模型在本站不存在。都是 HTTP 400，含义完全不同。
 
-**两个报错码值得记住**：`20041` = 模型不是 VLM（模型选错了）；`20012` = 模型在本站不存在。都是 HTTP 400，但含义完全不同，别混。
+#### 5.1.1.1 切过去的实际改动
+
+| 位置 | 改什么 |
+|:---|:---|
+| `config.toml` `[llm]` | `model = "deepseek-flash"`、`base_url = "https://api.deepseek.com/v1"` |
+| `.env` | **变量名不用改**，还是 `LLM_API_KEY`，把值换成 DeepSeek 的 Key；`.env.example` 一个字不动 |
+| 新增 `[vision]` 段 | **不需要** |
+
+**`[embedding]` 留在原地**：DeepSeek 官方**没有 embedding 接口**（定价页只有那两个 chat 模型），embedding 继续走硅基流动的 `Qwen/Qwen3-VL-Embedding-8B`。所以会是两个供应商并存 —— 这正是 `[llm]` / `[embedding]` 分段的设计用意。
+
+**两件还没验证的事（都要真实 Key）**：
+
+1. **模型 ID 以账号为准**：官方文档写 `deepseek-flash`，但第三方聚合站多用 `deepseek-v4.1-flash`，且文档说旧 ID 仍被接受并路由。拿到 Key 后先 `GET /v1/models` 钉死，别照抄。
+2. **thinking 默认是开是关**：`api-docs.deepseek.com/guides/reasoning_model` 只写了怎么**开**（`"thinking": {"type": "enabled"}` + `"reasoning_effort": "high"`），**没写怎么关，也没说默认值**。这直接关系到本项目的 **5 分钟被动回复窗口** —— 默认开着的话总结会明显变慢。`langchain-openai` 默认不传这个字段，所以大概率走非思考模式，但必须实测。
 
 #### 5.1.2 图片拿得到吗（2026-10-09 实测，结论未完成）
 
@@ -729,14 +742,22 @@ https://multimedia.nt.qq.com.cn/download?appid=<QQ 侧 appid>&fileid=<密文>&rk
 
 **要判定有效期，得隔几小时 / 隔天再放一次同样的请求。** 这个结论直接决定下面选哪个方案。
 
-#### 5.1.3 建议的接入方式
+#### 5.1.3 接入方式
 
-按项目现有的分层习惯（`[llm]` 与 `[embedding]` 本来就是各自独立的 `model` / `base_url` / `api_key`），新增一个 **`[vision]`** 段，只用于"把图片转成文字"，**不动 `[llm]`** —— 总结的质量与成本仍由 DeepSeek-V4-Flash 决定，视觉只是个前置转写器。
+因为 `deepseek-flash` 文本和视觉是**同一个模型**，不存在"另配一个视觉模型"这回事，两种时机都落在 `[llm]` 这一个客户端上：
 
-两个候选时机（**优先第 1 个**）：
+1. **入库时转写（优先）**：落库时（或跟着后台索引器那一批）取图 → 让模型描述 → 把描述并进 `body()`。下游 agent、检索、总结**一律不用改**，而且**在 URL 失效之前就已经取到了**，天然免疫时效问题。代价是每条图片消息多一次 API 调用，**必须放进后台批处理，不能做进事件回调**（那里连 embedding 都不许调）。
+2. **取数时传图**：把图片作为 image content block 发给同一个模型。更保真（能追问细节），但每轮都花 token、`_render` 的 12000 字预算**管不到图片**（上下文失控风险要单独处理），而且**一旦 URL 过期，历史图片就永久读不到了**。
 
-1. **入库时转写**：落库时（或跟着后台索引器那一批）取图 → 交给 `[vision]` 模型 → 把描述并进 `body()`。下游 agent、检索、总结**一律不用改**，而且**在 URL 失效之前就已经取到了**，天然免疫时效问题。代价是每条图片消息多一次 API 调用，必须放进后台批处理 —— **不能做进事件回调**（那里连 embedding 都不许调）。
-2. **取数时传图**：把图片作为 image content block 发给 vision LLM。更保真（能追问细节），但每轮都花 token、`_render` 的 12000 字预算**管不到图片**（上下文失控风险要单独处理），而且**一旦 URL 过期，历史图片就永久读不到了**。
+官方 vision 文档（`api-docs.deepseek.com/guides/vision`）给的硬约束，实现时照着写：
+
+- `content` 是数组：`{"type":"text","text":…}` + `{"type":"image_url","image_url":{"url":…}}`；
+- 图**只能放 user message**，放 system / assistant 直接 `400`；
+- 三种送图方式：base64 内联、**外链（URL ≤ 8192 字符）**、Files API 的 `file_id`；
+- **格式按真实文件内容判定，不看文件名与 MIME** —— 对 QQ 正好，我们拿到的是原始字节；
+- `detail`：`low`（缩到 512×512，更快更省）/ `high` ≡ `original` / `auto`；
+- **单张图上限 1024 tokens**（旧 `-exp` 是 384，别再用那个数），按输入价计费，**视觉无附加费**；
+- 外链**下载必须 60 秒内完成**、文件 ≤ 32 MiB —— 这是方案 2 的硬约束。
 
 图片要不要也进向量库是另一个独立决定：`[embedding].model` 现在填的就是 VL 模型，但进库的只有总结文本。
 
