@@ -211,3 +211,9 @@ uv run python test/test_offline.py
 - **刚产生的总结要等索引器跑完那一批才可被检索**（默认 10 秒一轮，入库时会主动唤醒）。
 - **同一群内多个机器人**时，@ 别的机器人也可能触发一次总结（判定仅依据 mentions 里的 `bot` 标志位）。
 - **升级自旧版本**：向量 collection 已从 `group_messages` 改名为 `summaries`，旧向量不会被读取（也不由代码删除）。确认不需要后可以手动删掉 `data/chroma_db/` 回收空间。
+
+---
+
+## 许可
+
+MIT，见 [`LICENSE`](LICENSE)。
