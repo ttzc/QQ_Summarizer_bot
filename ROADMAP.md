@@ -37,22 +37,22 @@
 - [ ] 真机观察：`asr_refer_text` 在真实语音上的**覆盖率**、长度、原文还是摘要风格。字段的存在与类型已由文档钉死，剩下的只能等第一条真语音落库（**当前语料里语音消息为 0 条**，2026-10-09 清点 `data/qqbot.db`，5 条带附件的全是图片）。
 - 不做：音频下载、音频存储、自建 ASR。
 
-### M2 · 图片的描述入库与读取
+### M2 · 图片的存储与读取 —— 方案已定稿：[`docs/MEDIA.md`](docs/MEDIA.md)
 
 现状：图片只渲染成 `[图片 <十六进制串>.jpg]`，信息量≈0（CLAUDE.md §5.1）。库里已经有 `url`，只是没人读。
 
-- [ ] **先钉死 URL 时效**：CLAUDE.md §5.1.2 只验证了 17 分钟内可下载；隔几小时 / 隔天重放同一批 URL，得出"耐久 or 限时"的结论。这个结论决定下面选哪条：
-  - 限时 → **只能走"入库时转写"**（方案 A），历史图片过期后永久读不到，接受；
-  - 耐久 → 方案 A 为主，方案 B 可选。
-- [ ] 新表 `media_tasks`（SQLite）：`message_id` / `url` / `content_type` / `status`（pending / done / failed / expired）/ `result_text` / `attempts`。事件回调里只做一件事——带图消息落库时顺手插一行 pending。
-- [ ] 后台转写器：仿 `SummaryIndexer` 的 wake + 批处理循环，取 pending → 下载图 → 调 `deepseek-flash` 生成 2-4 句描述（`detail="low"` 足够，图 ≤1024 token）→ 把描述**回写进该消息的 `content`**（替换占位标签）→ 标 done。失败退避重试，超过 N 次标 failed；下载 4xx/过期直接标 expired，不耗 LLM。
-- [ ] 待转写图片**不阻塞总结**：总结照常进行，只是那一张图在描述回来之前仍是占位标签。
-- [ ] 脱机测试：假下载器 + 假视觉模型，断言 pending → done 的迁移与 `content` 回写；expired 不再重试。
-- 不做：图片进向量库、图搜图、取数时传图（方案 B 先不做，`_render` 的 12000 字预算管不到图片，上下文失控要单独设计）。
+方案骨架：**落盘解决时效，按需看图解决语义**（定稿细节全部在 MEDIA.md）——
+
+- [ ] `data/media/YYYY-MM-DD/<sha256>.<ext>` 本地存图：按**消息发送日期**分桶，内容哈希全局去重（已登记即复用旧 path；tmp+rename 原子写盘）。URL 时效就此降级：队列分钟级排空 ≪ 实测 17 分钟有效期，历史图片不再依赖 `rkey` 寿命。
+- [ ] `media` 表（一行 = 一次附件出现；uuid 主键 + 哈希列文件去重；状态 pending → stored 终态，失败分态 expired / skipped / failed）+ `MediaWorker` 后台批处理**只落盘、零 LLM**（形态对齐 `SummaryIndexer`）。`SQLStore.insert_messages` 同事务插行，重复事件去重免费；消息占位嵌 8 位短 id：`[图片 xx.jpg #a1b2c3d4]`。
+- [ ] **`view_image(media_ref, focus?)` 工具**进群与私聊两个工具集（各 4→5 个）：agent 认为需要时才看——读本地文件 → 一次性视觉调用（**不进主循环、不进 checkpointer**，硬约束：ToolMessage 装不了图）→ 返回文字。无 focus 的通用描述**缓存回写** `description`+`content`（第二次看零调用），带 focus 的定向回答不落缓存。群内 scope 校验图片归属群；每群每次运行限 `max_views`，护 5 分钟被动回复窗口。
+- [ ] 图片**不预生成描述**：安静的讨论零成本；模型带着具体问题看图，比通用转写更有上下文。没人看过的图保持占位 = "只有总结过的话题可检索"既有限制，不是新缺口。
+- [ ] 脱机验收 = MEDIA.md 的 11 条清单（`tests/test_media.py`：假下载器 + 假视觉，真 SQLite + 真写盘；顺带更新 `test_agent.py` 的工具集断言）。
+- 不做（本期）：图片进向量库、图搜图；把图块塞进 agent 循环反复放大看像素 → **M2.5** 保留选项（机制代价清单在 MEDIA.md 末节，触发条件出现再立项；与 `view_image` 缓存语义兼容，只加不减）。
 
 ### M3 · PDF 转图
 
-PDF 是 `Attachment(content_type="application/pdf")`，同样先进 `media_tasks`，只是处理管线多一步：
+PDF 是 `Attachment(content_type="application/pdf")`，同样先进 `media` 表（M2 的表扩一个文件形态分支即可，见 MEDIA.md），只是处理管线多一步：
 
 - [ ] 依赖 `pymupdf`：打开 PDF → 逐页渲染 PNG（限 DPI，够模型认字即可）→ 逐页走 M2 的"视觉模型描述"→ 拼接成 `[PDF <name>，共 N 页] 第1页: … 第2页: …` 回写。
 - [ ] 护栏：页数上限（如 30）、单文件上限（32 MiB，官方外链下载须 60 秒内完成）、超限记 `[PDF 过大，仅转写前 N 页]`。

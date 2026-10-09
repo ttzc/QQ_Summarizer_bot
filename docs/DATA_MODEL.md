@@ -10,7 +10,7 @@
 
 | 层 | 位置 | 存什么 | 谁写 | 谁读 | 生命周期 |
 |:---|:---|:---|:---|:---|:---|
-| **SQLite** | `data/qqbot.db` | 消息全量 + 总结全量 + 索引进度标记 | 事件回调（同步、快）、总结入库 | 工具、indexer、CLI | 永久，唯一真相源 |
+| **SQLite** | `data/qqbot.db` | 消息全量 + 总结全量 + 索引进度标记 + `media` 附件队列/状态（M2，§2.7） | 事件回调（同步、快，消息与 media 行同事务）、总结入库、后台 MediaWorker | 工具（`view_image`）、MediaWorker、CLI | 永久，唯一真相源 |
 | **Chroma** | `data/chroma_db/` | 每篇**总结**一个向量文档 | 后台 indexer（批量、慢） | `search_summaries` 工具 | 可从 SQLite 完全重建 |
 | **内存** | 进程内 | agent 多轮会话状态 | `Summarizer` | agent 自身 | 进程退出即丢 |
 
@@ -152,6 +152,46 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
 - **老数据不会自动重写**。逐字原文（整个 `d`）仍在 `raw_json` 里，所以这一步可回填，但**升级前入库的行仍是老语义下的 `d.content`**——引用 / 纯图片那类在取数时看起来就是一行空白。需要时从 `raw_json` 重建即可。
 - **`msg_elements` 不单独建表**。引用 / 合并转发的嵌套内容在事件解析阶段被摊平成文本写进 `content`，结构本身不留存；要支持"展开某条合并转发"得改这里。
 - **`raw_json` 目前无消费者**。它保证即使解析逻辑有遗漏，原始数据也没丢，未来可以据此回填（例如按上面的取舍回填旧行）。
+
+### 2.7 `media` — 图片附件表（M2 规划中，随实现生效）
+
+一条**附件出现**一行（不是一张去重后的图）：同图被多人转发时共享同一个磁盘文件（按 `sha256` 复用 `path`），但每次出现都有自己的处理状态、短 id 与回写锚点。方案的动机与管线见 `MEDIA.md`；本节只管表结构。
+
+| 列 | 类型 | 说明 |
+|:---|:---|:---|
+| `media_id` | TEXT **PK** | `uuid4().hex`。与 `summary_id` 同款教训：**不用内容哈希做主键**（哈希 + `INSERT OR IGNORE` 会吃掉"第二次出现"）。消息正文里的 `#短id` = 它的前 8 位 |
+| `message_id` | TEXT NOT NULL，FK → `group_messages` | `ON DELETE CASCADE` |
+| `group_openid` | TEXT NOT NULL | 群内 `view_image` 的归属校验靠它（短 id 只有 8 hex，可被猜，必须显式拒绝跨群） |
+| `placeholder` | TEXT NOT NULL | **写库当时**渲染出的占位文本（含 `#短id`），描述回写时对 `content` 做定向 `replace` 的锚点。事后重算 `label()` 一旦格式演进过就替换不中 |
+| `url` / `filename` / `content_type` / `event_size` / `width` / `height` | — | 事件原始信息。`event_size` 在下载前先做超限预判 |
+| `status` | TEXT NOT NULL | `pending`（默认）→ `stored`（终态，等工具按需取用）；失败分态 `expired`（下载 4xx，签名失效，不耗 LLM）/ `skipped`（魔数不在白名单 / 超限）/ `failed`（网络/5xx 重试耗尽） |
+| `sha256` | TEXT | 下载字节的哈希 = 存储文件名。已登记过即复用旧 `path`（跨天转发、跨日期桶都不复制文件） |
+| `path` | TEXT | 相对 `data/` 的落盘路径：`media/YYYY-MM-DD/<sha256>.<ext>`。日期 = **消息发送日期**（跨天重试也落回原桶），桶由首次入库决定 |
+| `description` | TEXT | 通用描述的**缓存**（`view_image` 无 focus 调用产出）。带 focus 的定向回答不落这里 |
+| `attempts` / `last_error` | INTEGER / TEXT | 重试簿记 |
+| `created_at` / `updated_at` | TEXT | 入库 / 状态变更时刻 |
+
+```sql
+CREATE INDEX idx_media_pending ON media(status, created_at) WHERE status = 'pending';  -- Worker 取队
+```
+
+**写路径**：`SQLStore.insert_messages()` 在插入消息的**同一事务**里，为图片形态的附件（`Attachment.is_voice()` 同理的 `content_type` 判定）插 media 行，并把该消息 `content` 里的占位换成带短 id 的版本。去重免费——重复事件时消息本体 `INSERT OR IGNORE` 插不进，media 分支根本不执行。`§2.2` 的 `has_media` 从此与"media 表有行"等价，保留它只为不查表就能过滤。
+
+**一条存了图的消息，三跳找到自己的图**：
+
+```
+group_messages.content   "15:03 小红: 看这个 [图片 6A3051F3.jpg #4d9f2a1c]"
+        │ 取数工具把整行喂给模型；模型想看图 →
+        ▼
+media (media_id LIKE '4d9f2a1c%')   status=stored, path=media/2026-10-10/e3b0c4….jpg
+        │ view_image 读文件 → 一次性视觉调用 →
+        ▼
+磁盘 data/media/2026-10-10/e3b0c4….jpg          ← 字节，与 rkey 寿命无关
+```
+
+看过的图，`content` 里的占位会变成 `[图片 6A3051F3.jpg #4d9f2a1c：<通用描述>]`——回写与 `media.description` 在**同一事务**，不存在"状态说看过、正文还是占位"的中间态。
+
+⚠️ **`path` 非空 ≠ 图能看**：磁盘文件是这条记录存在的全部理由，但清理本期不做（见 §六）；`expired`/`skipped` 的行 `path` 恒为 `NULL`，占位分别被改注 `[图片 已过期]` / `[图片 格式不支持]`，让取数可见、模型不会去调一个必然失败的工具。
 
 ---
 
@@ -301,6 +341,8 @@ index.reset()                                 # 再清向量
 |:---|:---|
 | `group_messages` | ❌ 只增不减。目前没有归档或过期策略 |
 | `summaries` | ❌ 只增不减；`indexed_at` 是唯一的可变列 |
+| `media` 行 | ❌ 只增不减（M2，§2.7）；`status`/`sha256`/`path`/`description` 随后台处理与工具调用更新 |
+| `data/media/` 磁盘文件 | ❌ 无 TTL；按消息日期分桶，增长 ∝ 图片量（估算 ≈20MB/天/5 活跃群）。不设便捷删除命令——删文件=删语料（M2，§2.7） |
 | Chroma collection | 仅在 `reindex --reset` 时整体重建 |
 | agent 会话记忆 | ✅ LRU 淘汰 + 进程退出 |
 | 自动总结冷却（内存） | ✅ 进程退出即丢。若重启时积压仍超阈值，会立刻再自动总结一次——多一篇文档，无害 |

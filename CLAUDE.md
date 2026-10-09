@@ -784,7 +784,7 @@ https://multimedia.nt.qq.com.cn/download?appid=<QQ 侧 appid>&fileid=<密文>&rk
 - **单张图上限 1024 tokens**（旧 `-exp` 是 384，别再用那个数），按输入价计费，**视觉无附加费**；
 - 外链**下载必须 60 秒内完成**、文件 ≤ 32 MiB —— 这是方案 2 的硬约束。
 
-图片要不要也进向量库是另一个独立决定：`[embedding].model` 现在填的就是 VL 模型，但进库的只有总结文本。
+图片要不要也进向量库是另一个独立决定：`[embedding].model` 现在填的就是 VL 模型，但进库的只有总结文本。**M2 方案已定稿 → [`docs/MEDIA.md`](docs/MEDIA.md)**：上面两个方案都不是终态——定稿为"**落盘解决时效，按需看图解决语义**"：后台 `MediaWorker` **只落盘零 LLM**（`data/media/YYYY-MM-DD/<sha256>.<ext>`，全局哈希去重），URL 时效就此降级；**不预生成描述**，改为 `view_image` 工具（进群/私聊两个工具集各 +1）——agent 认为需要时才看，工具内部一次性视觉调用返回文字（硬约束：ToolMessage 装不了图，图只能进 user message），通用描述缓存回写、定向 focus 不落缓存，群内 scope 校验归属、每群每次限次数。图块塞进 agent 循环反复放大 = M2.5 保留选项（机制代价清单见 MEDIA.md 末节）。
 
 纯文档 / 排期：
 
