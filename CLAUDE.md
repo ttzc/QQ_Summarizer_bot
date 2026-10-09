@@ -689,14 +689,56 @@ flowchart TB
 - `Attachment`（`events.py:56`）已经解析并**持久化** `url` / `filename` / `content_type` / `size` / `width` / `height`，逐字原文在 `raw_json` 里 —— **图片 URL 本来就在库里，只是没人读**（实测 `content_type=image/jpeg`、`width=196`、`height=231`）。
 - `[embedding].model` 现在填的就是 VL 模型；但目前只有**总结文本**进向量库，图片本身不入库。
 
-两个候选接入点（各有取舍，尚未选择）：
+#### 5.1.1 选哪个模型（2026-10-09 实测）
 
-1. **入库时转写**：消息落库时对图片跑一次"看图说话"，把结果并进 `content`（`body()` 的产物）。下游 agent、检索、总结**一律不用改**，改动面最小。
-2. **取数时传图**：把图片 URL 作为 image content block 发给 vision LLM。更保真（能追问细节），但每轮都花 token，且 `_render` 的 12000 字预算**管不到图片**，上下文失控的风险要单独处理。
+**当前配置的 `deepseek-ai/DeepSeek-V4-Flash` 是纯文本模型，不吃图片。** 网关自己会拒掉：
 
-⚠️ **必须先核实的前提：QQ 附件 URL 的时效性。** 实测 URL 形如
-`https://multimedia.nt.qq.com.cn/download?appid=<QQ 侧 appid>&fileid=<密文>&rkey=<下载密钥>&spec=0`
-—— 带 `rkey`（下载密钥）参数，**几乎肯定是限时签名链接**。如果过期后取不到图，方案 2 就只能对"刚到达的消息"生效，历史图片永远读不了；而方案 1 在入库那一刻就取用，天然免疫。**这条决定架构，得先在真机上验一下 URL 的有效期。**
+```
+POST /v1/chat/completions    （content 里带 image_url）
+→ HTTP 400 {"code":20041,"message":"The model is not a VLM (Vision Language Model). Please use text-only prompts."}
+```
+
+**DeepSeek 的视觉版不在国内站。** `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` 确实存在（SiliconFlow 国际站 `siliconflow.com` 上有模型页：原生支持 JPEG/PNG/GIF/WebP、**图片只允许放在 user message**、每张图最多按 384 tokens 计费、1M 上下文），但在 `api.siliconflow.cn` 上直接是：
+
+```
+→ HTTP 400 {"code":20012,"message":"Model does not exist. Please check it carefully."}
+```
+
+拉一遍 `GET /v1/models`（98 个条目）可确认：**国内站没有任何 DeepSeek 视觉对话模型**。唯一的 `deepseek-ai/DeepSeek-OCR` 是文档 OCR，不是通用视觉模型 —— 拿一张纯色图喂它，它吐了一串并不存在的"购物保障 / 正品保证"广告词，纯幻觉，**不能当视觉模型用**。
+
+**好消息：不用换网关。** 同一个 key、同一个 `base_url`，Qwen3-VL 系列就能用：
+
+```
+POST /v1/chat/completions  model=Qwen/Qwen3-VL-8B-Instruct  （64×64 纯红图 + "这张图主要是什么颜色？"）
+→ 200 "红色"
+```
+
+国内站上可选的视觉模型：`Qwen/Qwen3-VL-8B-Instruct` / `-Thinking`、`Qwen/Qwen3-VL-30B-A3B-Instruct` / `-Thinking`、`Qwen/Qwen3-VL-32B-Instruct` / `-Thinking`，另有 `PaddlePaddle/PaddleOCR-VL-1.5`（偏文档解析）。与 embedding 现在用的 `Qwen/Qwen3-VL-Embedding-8B` 同门。
+
+**两个报错码值得记住**：`20041` = 模型不是 VLM（模型选错了）；`20012` = 模型在本站不存在。都是 HTTP 400，但含义完全不同，别混。
+
+#### 5.1.2 图片拿得到吗（2026-10-09 实测，结论未完成）
+
+库里 6 条带图消息的 URL，在到达后**约 17 分钟**重放：**5/5 全部下载成功**（HTTP 200，35KB ~ 950KB，magic bytes 对得上：`\xff\xd8\xff` = JPEG、`GIF8` = GIF），格式覆盖 `image/jpeg` 与 `image/gif`，都在 Qwen3-VL 的支持列表内。
+
+⚠️ **这只证明"URL 可用"，没证明"URL 耐久"。** URL 带 `rkey`（下载密钥），结构上就是限时签名链接：
+
+```
+https://multimedia.nt.qq.com.cn/download?appid=<QQ 侧 appid>&fileid=<密文>&rkey=<下载密钥>&spec=0
+```
+
+**要判定有效期，得隔几小时 / 隔天再放一次同样的请求。** 这个结论直接决定下面选哪个方案。
+
+#### 5.1.3 建议的接入方式
+
+按项目现有的分层习惯（`[llm]` 与 `[embedding]` 本来就是各自独立的 `model` / `base_url` / `api_key`），新增一个 **`[vision]`** 段，只用于"把图片转成文字"，**不动 `[llm]`** —— 总结的质量与成本仍由 DeepSeek-V4-Flash 决定，视觉只是个前置转写器。
+
+两个候选时机（**优先第 1 个**）：
+
+1. **入库时转写**：落库时（或跟着后台索引器那一批）取图 → 交给 `[vision]` 模型 → 把描述并进 `body()`。下游 agent、检索、总结**一律不用改**，而且**在 URL 失效之前就已经取到了**，天然免疫时效问题。代价是每条图片消息多一次 API 调用，必须放进后台批处理 —— **不能做进事件回调**（那里连 embedding 都不许调）。
+2. **取数时传图**：把图片作为 image content block 发给 vision LLM。更保真（能追问细节），但每轮都花 token、`_render` 的 12000 字预算**管不到图片**（上下文失控风险要单独处理），而且**一旦 URL 过期，历史图片就永久读不到了**。
+
+图片要不要也进向量库是另一个独立决定：`[embedding].model` 现在填的就是 VL 模型，但进库的只有总结文本。
 
 纯文档 / 排期：
 
