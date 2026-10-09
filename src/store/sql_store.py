@@ -127,7 +127,12 @@ class SQLStore:
                 rec.author_openid,
                 rec.author_name,
                 rec.member_role,
-                rec.content,
+                # `body()`, not `content`: the raw text is blank for quote
+                # (103) and merged-forward (102) messages, and the only text a
+                # voice message carries is its ASR transcript. Storing the raw
+                # column would make every one of those an empty line in the
+                # prompt. The verbatim payload stays in `raw_json`.
+                rec.body(),
                 rec.message_type,
                 rec.ts.isoformat(),
                 rec.msg_idx,

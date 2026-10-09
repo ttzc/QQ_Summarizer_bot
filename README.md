@@ -76,27 +76,23 @@ uv sync
 cp .env.example .env
 ```
 
-然后在 `.env` 里填两组凭据：
+然后在 `.env` 里填凭据 —— **只放敏感的 key**：
 
-| 变量 | 必填 | 说明 |
-|:---|:---:|:---|
-| `QQ_APPID` | ✅ | QQ 开放平台 → 机器人管理端 → 开发设置 |
-| `QQ_SECRET` | ✅ | 同上 |
-| `LLM_MODEL` | ✅ | 任意 OpenAI 兼容模型名 |
-| `LLM_BASE_URL` | ⬜ | 留空则走 OpenAI 官方端点；用别家网关填它的兼容端点地址 |
-| `LLM_API_KEY` | ✅ | LLM 网关的 key |
-| `EMBED_MODEL` | ✅ | embedding 模型名（可与 LLM 不同网关） |
-| `EMBED_BASE_URL` / `EMBED_API_KEY` | ⬜ | 同上 |
+| 变量 | 说明 |
+|:---|:---|
+| `QQ_APPID` / `QQ_SECRET` | QQ 开放平台 → 机器人管理端 → 开发设置（appid 不算密钥，但与 secret 成对使用，放一起不容易漏填） |
+| `LLM_API_KEY` | LLM 网关的 key |
+| `EMBED_API_KEY` | embedding 网关的 key（可与 `[llm]` 不是同一个网关） |
 
 `.env` 已在 `.gitignore` 中，**不要把真实凭据提交进仓库**。
 
-其余参数在 `config.toml`，按段划分：
+**模型名与网关地址不是密钥，直接写在 `config.toml`** —— 换网关、换模型只改这两行，不必动 `.env`：
 
 | 段 | 关键项 |
 |:---|:---|
 | `[qq]` | `is_sandbox`（新版管理端一般填 `false`） |
-| `[llm]` | `temperature` / `max_tokens` / `timeout` |
-| `[embedding]` | `batch_size`（默认 25，保守值；网关吃得下更大批再调高 `MAX_EMBED_BATCH`） |
+| `[llm]` | `model` / `base_url`（留空 = OpenAI 官方端点）/ `temperature` / `max_tokens` / `timeout` |
+| `[embedding]` | `model`（**必需**，留空会在启动时明确报错）/ `base_url` / `batch_size`（默认 25，保守值；网关吃得下更大批再调高 `MAX_EMBED_BATCH`） |
 | `[store]` | SQLite 路径、Chroma 路径与 collection 名（`summaries`） |
 | `[summary]` | `default_recent_n` / `max_reply_chars` / `max_replies` / `passive_reply_deadline_s` |
 | `[auto_summary]` | `enabled` / `min_messages`（阈值）/ `cooldown_s`（两次尝试的最小间隔）/ `notify`（是否发到群里）/ `groups`（白名单，空 = 全部群）/ `instruction` |
@@ -104,7 +100,7 @@ cp .env.example .env
 | `[groups]` | 可选的群 `openid` → 人话名字映射，会出现在私聊回答里 |
 | `[logging]` | 日志级别与目录 |
 
-`config.toml` 里的 `${VAR}` 会在启动时从 `.env` 展开；某个变量没设时保持原样，对应配置项按"未设置"处理（而不是把 `"${VAR}"` 当成真的值发出去）。
+`config.toml` 里的 `${VAR}` 会在启动时从 `.env` 展开；某个变量没设时保持原样，对应配置项按"未设置"处理（而不是把 `"${VAR}"` 当成真的值发出去）。留空的 `model` 会在启动时直接报错 —— 模型名没有可用的默认值。
 
 `[auto_summary]` 的默认值是：每群累计 200 条新消息触发一次，两次尝试至少间隔 1800 秒（**失败也算**，否则网关出故障时每条消息都会重试一次）。消息密的群把 `min_messages` 调大，只想让部分群自动总结就用 `groups` 列 openid，不想要就 `enabled = false`。`qqbot stats` 的「待总结」列就是离触发还差多少。
 
@@ -161,8 +157,8 @@ uv run qqbot stats                                 # 看各群离自动总结还
 flowchart LR
     ROOT["QQ_Summarizer_bot/"]
     ROOT --- MAIN["main.py<br/>薄包装 → scripts.cli:main"]
-    ROOT --- CFG["config.toml<br/>业务配置（${VAR} 从 .env 展开）"]
-    ROOT --- ENVF[".env.example<br/>入库；.env 不入库"]
+    ROOT --- CFG["config.toml<br/>非敏感配置（模型名 / base_url / 阈值）<br/>仅凭据用 ${VAR} 引用 .env"]
+    ROOT --- ENVF[".env.example<br/>只放敏感凭据；入库<br/>（.env 不入库）"]
     ROOT --- PROMPT["prompts/<br/>common.md（两 scope 共用）<br/>+ summarizer.md / c2c.md"]
     ROOT --- CLI["scripts/cli.py<br/>命令行入口"]
     ROOT --- TEST["test/test_offline.py<br/>脱机验证套件"]
@@ -188,7 +184,7 @@ flowchart LR
 uv run python test/test_offline.py
 ```
 
-覆盖事件解析、SQLite 去重与时间范围查询、总结入库与索引、回复分段（群 + 私聊）、agent 工具边界与跨群可见性（含伪造 `runtime`/`scope` 的越权尝试）、以及自动总结的阈值 / 冷却 / 静默与通知 / 同群串行等 **255 条断言**，全部脱机运行，不需要任何凭据。
+覆盖事件解析、SQLite 去重与时间范围查询、消息正文的文本化落库、总结入库与索引、回复分段（群 + 私聊）、agent 工具边界与跨群可见性（含伪造 `runtime`/`scope` 的越权尝试）、以及自动总结的阈值 / 冷却 / 静默与通知 / 同群串行等 **258 条断言**，全部脱机运行，不需要任何凭据。
 
 ---
 

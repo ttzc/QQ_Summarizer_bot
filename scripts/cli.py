@@ -36,6 +36,17 @@ def _ensure_utf8_stdout() -> None:
             stream.reconfigure(encoding="utf-8")
 
 
+def _missing_models() -> list[str]:
+    """Unset model names, by config section.
+
+    A model name is not a secret, so it lives in `config.toml` — which also means
+    "forgot to fill it in" is an ordinary configuration error and deserves to be
+    reported before the bot connects to QQ rather than on the first summary.
+    """
+    checks = (("[llm].model", config.llm), ("[embedding].model", config.embedding))
+    return [name for name, section in checks if not section.resolved_model]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="qqbot",
@@ -94,6 +105,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(
             "❌ 缺少 QQ 凭据：请复制 .env.example 为 .env，填好 QQ_APPID / QQ_SECRET。\n"
             "   （config.toml 的 [qq] 段通过 ${QQ_APPID} / ${QQ_SECRET} 读取它们）",
+            file=sys.stderr,
+        )
+        return 2
+    if missing := _missing_models():
+        print(
+            f"❌ config.toml 里还没有模型名：{'、'.join(missing)}。\n"
+            "   模型名与 base_url 是配置项，写在 config.toml；.env 只放 API key。",
             file=sys.stderr,
         )
         return 2
@@ -297,9 +315,12 @@ def main(argv: list[str] | None = None) -> int:
     setup_logger(console=args.verbose)
     try:
         return args.handler(args)
-    except Exception:  # noqa: BLE001 - a CLI must exit with a message, not a trace
+    except Exception as exc:  # noqa: BLE001 - a CLI must exit with a message, not a trace
         logger.exception("命令执行失败")
-        print("❌ 执行失败，详见 logs/app.log", file=sys.stderr)
+        # The message matters here: the likeliest failures are configuration ones
+        # (missing model, bad key), and sending the user to a log file for those
+        # is worse than echoing the one line that says what to fix.
+        print(f"❌ {args.command} 执行失败：{exc}\n   详见 logs/app.log", file=sys.stderr)
         return 1
 
 

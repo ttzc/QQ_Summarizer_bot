@@ -239,6 +239,25 @@ def test_store() -> None:
         recent = store.recent_messages("G_demo", limit=10)
         check("取回 3 条且按时间正序", len(recent) == 3 and recent[0]["author_name"] == "小明")
 
+        # 落库的是「文本化」的正文，不是原始 content：引用消息的原始 content 是
+        # 空白、图片消息的文字全在附件上，直接存原始值会让这些消息在 prompt 里
+        # 变成一行空白。原文（原始 d）仍完整留在 raw_json。
+        by_id = {row["message_id"]: row for row in recent}
+        check(
+            "图片消息的附件标签落库",
+            "[图片 photo.jpg]" in by_id["ROBOT1.0_image"]["content"],
+            by_id["ROBOT1.0_image"]["content"],
+        )
+        check(
+            "引用消息的引用正文落库",
+            "明天有空吗" in by_id["ROBOT1.0_quote"]["content"],
+            by_id["ROBOT1.0_quote"]["content"],
+        )
+        check(
+            "原文仍保留在 raw_json",
+            "message_scene" in by_id["ROBOT1.0_quote"]["raw_json"],
+        )
+
         rng = store.messages_in_range(
             "G_demo", "2026-07-21T09:00:00+08:00", "2026-07-21T11:00:00+08:00", limit=10
         )

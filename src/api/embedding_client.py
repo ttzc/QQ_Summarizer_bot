@@ -52,8 +52,14 @@ def get_embeddings() -> Embeddings:
         return _embeddings
 
     cfg = config.embedding
+    if not cfg.resolved_model:
+        raise RuntimeError(
+            "config.toml 的 [embedding].model 为空：请填上网关上的 embedding 模型名"
+            "（模型名不是敏感项，不再从 .env 读）。"
+        )
+
     overrides: dict = {
-        "model": cfg.model,
+        "model": cfg.resolved_model,
         "provider": "openai",
         "openai_api_key": cfg.resolved_api_key,
         "base_url": cfg.resolved_base_url,
@@ -66,7 +72,7 @@ def get_embeddings() -> Embeddings:
     logger.info(
         "初始化 embedding 模型",
         extra={
-            "model": cfg.model,
+            "model": cfg.resolved_model,
             "base_url": cfg.resolved_base_url or "(默认)",
             "batch_size": embedding_batch_size(),
         },

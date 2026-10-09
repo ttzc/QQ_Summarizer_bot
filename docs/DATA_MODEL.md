@@ -49,7 +49,7 @@ PRAGMA busy_timeout=5000     # 万一有第二个进程，不立即 SQLITE_BUSY
 | `author_openid` | TEXT | 发言者标识（匿名化，非 QQ 号） |
 | `author_name` | TEXT | 发言人**昵称**——botpy 的 `GroupMessage` 会丢掉，本项目从原始 `d` 里取回 |
 | `member_role` | TEXT | `member` / `admin` / `owner` |
-| `content` | TEXT | 正文。**引用与合并转发时可能为空**，内容在 `msg_elements` 里（未单独入库，见 §2.6） |
+| `content` | TEXT | 正文的**文本形态**：原始文本 + 附件占位（`[图片 photo.jpg]`）+ 语音转写 + 引用 / 合并转发的元素正文。**不是逐字原文**——逐字的在 `raw_json`（见 §2.6） |
 | `message_type` | INTEGER | 0 文本 / 3 卡片 / 101 并行 / 102 聊天记录 / 103 引用 |
 | `ts` | TEXT NOT NULL | ISO8601 |
 | `msg_idx` | TEXT | 来自 `message_scene.ext` |
@@ -148,8 +148,10 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
 
 ### 2.6 已知的存储取舍
 
-- **`msg_elements` 不单独建表**。引用 / 合并转发的嵌套内容只在事件解析阶段被摊平成文本，进入 `content` 之外的地方就不保留了。如果要支持"展开某条合并转发"，得改这里。
-- **`raw_json` 目前无消费者**。它保证即使解析逻辑有遗漏，原始数据也没丢，未来可以据此回填。
+- **`content` 存的是渲染文本，不是逐字原文**。写库时取的是 `GroupMessageRecord.body()`：QQ 在引用（103）与合并转发（102）消息上把顶部 `content` 留空，正文只在 `msg_elements` 里；语音消息的文字部分是附件上的 `asr_refer_text`。若存原始 `content`，这些消息在取数时就是**一行空白**。
+- **老数据不会自动重写**。逐字原文（整个 `d`）仍在 `raw_json` 里，所以这一步可回填，但**升级前入库的行仍是老语义下的 `d.content`**——引用 / 纯图片那类在取数时看起来就是一行空白。需要时从 `raw_json` 重建即可。
+- **`msg_elements` 不单独建表**。引用 / 合并转发的嵌套内容在事件解析阶段被摊平成文本写进 `content`，结构本身不留存；要支持"展开某条合并转发"得改这里。
+- **`raw_json` 目前无消费者**。它保证即使解析逻辑有遗漏，原始数据也没丢，未来可以据此回填（例如按上面的取舍回填旧行）。
 
 ---
 
@@ -320,7 +322,7 @@ index.reset()                                 # 再清向量
 |:---|:---|:---|
 | `author_name` | `d.author.username` | 走 `GROUP_AT_MESSAGE_CREATE` 降级路径时 botpy 拿不到昵称，恒为 `NULL`；展示层会退化成 `成员<openid 后 4 位>` |
 | `member_role` | `d.author.member_role` | 同上 |
-| `content` | `d.content` | 引用 / 合并转发消息（`message_type` 102/103）正文常为空，实际内容在 `msg_elements` |
+| `content` | `GroupMessageRecord.body()`（= `d.content` + 附件标签 + `asr_refer_text` + `msg_elements` 摊平） | 真的没有任何文本时（纯图片无正文）只剩 `[图片 photo.jpg]` 这类占位；**升级前入库的旧行**按老语义存的是 `d.content`，引用 / 合并转发那类会看起来是空的 |
 | `msg_idx` / `ref_msg_idx` | `d.message_scene.ext` | 非引用消息通常没有 |
 | `ts` | `d.timestamp` | 解析失败时回退为入库时刻（`datetime.now()`），不会为 `NULL` |
 | `event_id` | WS 帧顶层 `id` | 走 botpy `GroupMessage` 时取 `message.event_id` |

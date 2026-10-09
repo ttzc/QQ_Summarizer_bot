@@ -2,7 +2,7 @@
 
 QQ 群消息总结机器人：接入 QQ 官方机器人（群聊能力）接收群消息，用 LangChain 驱动 LLM 做摘要。
 
-本项目是自包含的：不依赖仓库之外的任何文件或目录，也不绑定任何具体的模型厂商或云网关——所有网关都是 OpenAI 兼容端点，靠 `.env` 切换。
+本项目是自包含的：不依赖仓库之外的任何文件或目录，也不绑定任何具体的模型厂商或云网关——所有网关都是 OpenAI 兼容端点，模型名与 `base_url` 写在 `config.toml`，`.env` 只放敏感凭据（api key / QQ secret），靠 `${VAR}` 被 `config.toml` 引用。
 
 面向使用者的说明见 [`README.md`](README.md)；架构与数据模型的细节见 [`docs/`](docs/)。
 
@@ -10,13 +10,13 @@ QQ 群消息总结机器人：接入 QQ 官方机器人（群聊能力）接收�
 
 ## 项目现状
 
-**实现已完成（脱机可验证部分）**：脱机测试 **255 条断言**全绿。未完成的只剩真机联调（见 §五）。
+**实现已完成（脱机可验证部分）**：脱机测试 **258 条断言**全绿。未完成的只剩真机联调（见 §五）。
 
 ```mermaid
 flowchart LR
     ROOT["QQ_Summarizer_bot/"]
     ROOT --- MAIN["main.py<br/>薄包装 → scripts.cli:main"]
-    ROOT --- CFG["config.toml<br/>业务配置（${VAR} 引用 .env）"]
+    ROOT --- CFG["config.toml<br/>非敏感配置（模型名 / base_url / 阈值）<br/>仅凭据用 ${VAR} 引用 .env"]
     ROOT --- ENVF[".env / .env.example<br/>.env 不入库；.env.example 入库"]
     ROOT --- RD["README.md<br/>面向使用者的说明"]
     ROOT --- DOCS["docs/<br/>ARCHITECTURE.md / DATA_MODEL.md"]
@@ -552,7 +552,7 @@ flowchart TB
 
 | 层 | 位置 | 存什么 | 谁写 |
 |:---|:---|:---|:---|
-| SQLite | `data/qqbot.db` | 原文全量 `group_messages` + 总结全量 `summaries`（`indexed_at IS NULL` 即索引进度） | `on_group_message_create`（同步、快）；总结入库 |
+| SQLite | `data/qqbot.db` | 原文全量 `group_messages`（`content` 列存的是**文本化正文**，逐字原文在 `raw_json`）+ 总结全量 `summaries`（`indexed_at IS NULL` 即索引进度） | `on_group_message_create`（同步、快）；总结入库 |
 | Chroma | `data/chroma_db/` | **一篇总结一个**向量文档（collection `summaries`） | 后台 indexer（批量、慢） |
 | 内存 | `InMemorySaver` | agent 多轮会话状态 | `Summarizer`，LRU 128 条线程（群 + 私聊共享） |
 
@@ -623,7 +623,7 @@ flowchart TB
 
 ## 五、待办 / 下一步
 
-**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI —— 见 §项目现状，脱机测试 **255 条断言**全绿。
+**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI —— 见 §项目现状，脱机测试 **258 条断言**全绿。
 
 **剩余（按能否脱机划分为两类）**：
 

@@ -10,6 +10,12 @@ CREATE TABLE IF NOT EXISTS group_messages (
     author_openid TEXT,
     author_name   TEXT,                      -- dropped by botpy's GroupMessage
     member_role   TEXT,                      -- member / admin / owner
+    -- The message as *text*: raw `content` plus placeholders for attachments
+    -- (`[图片 photo.jpg]`), voice ASR transcripts, and the bodies of quoted /
+    -- merged-forward elements. Not the verbatim payload — for quote (103) and
+    -- forward (102) messages the raw text is empty and this is the only copy of
+    -- the words; the original `d` is in `raw_json`. Rows written before this
+    -- column changed meaning hold the raw text alone.
     content       TEXT,
     message_type  INTEGER,                   -- 0 text, 3 card, 101/102/103 ...
     ts            TEXT NOT NULL,             -- ISO8601

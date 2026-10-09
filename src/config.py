@@ -1,15 +1,19 @@
 """Application configuration.
 
+`config.toml` holds everything that is not a secret — model names, gateway URLs,
+thresholds — and refers to `.env` only for credentials, via `${VAR}`.
+
 Load order matters: `load_dotenv()` runs at import time, *before* the config is
-parsed, so `${VAR}` placeholders in `config.toml` resolve from `.env`.
+parsed, so those placeholders resolve.
 
 Two requirements shape this:
 
 1. `config.toml` is resolved relative to the project root, not the CWD, so the
    bot keeps working no matter which directory it is launched from.
-2. Unsubstituted placeholders (env var missing) are exposed as `None` via the
-   `resolved_*` properties instead of leaking the literal ``"${VAR}"`` into API
-   clients, where it would fail silently with a 401 much later.
+2. A field that is effectively unset — env var missing, or the value left empty
+   on purpose — is exposed as `None` via the `resolved_*` properties instead of
+   leaking the literal ``"${VAR}"`` (or an empty string) into API clients, where
+   it would fail much later as a 401 or an unknown-model error.
 """
 
 from __future__ import annotations
@@ -51,9 +55,17 @@ def _expand_dict(raw: dict) -> dict:
     return out
 
 
-def _unresolved(value: str) -> bool:
-    """True when `${VAR}` was never substituted — i.e. the env var is unset."""
-    return value.startswith("${")
+def _resolve(value: str) -> str | None:
+    """A configured string, or `None` when it is effectively unset.
+
+    Three ways a field can be blank, all collapsed here: `${VAR}` was never
+    substituted (env var missing), the value was left empty in `config.toml`, or
+    it is whitespace. Callers read `None` as "fall back to the client's default",
+    which is why an empty `base_url` means the provider's own endpoint rather
+    than the empty string being sent as a URL.
+    """
+    text = value.strip()
+    return None if not text or text.startswith("${") else text
 
 
 def _resolve_path(value: str) -> Path:
@@ -68,51 +80,61 @@ class QQConfig(BaseModel):
 
     @property
     def resolved_appid(self) -> str | None:
-        return None if _unresolved(self.appid) else self.appid
+        return _resolve(self.appid)
 
     @property
     def resolved_secret(self) -> str | None:
-        return None if _unresolved(self.secret) else self.secret
+        return _resolve(self.secret)
 
 
 class LLMConfig(BaseModel):
-    """Configurable by design — no provider is hard-coded. Point `base_url` at
-    any OpenAI-compatible endpoint, or leave it unset to fall back to the
-    OpenAI default."""
+    """Any OpenAI-compatible endpoint — no provider is hard-coded.
 
-    model: str = "${LLM_MODEL}"
-    base_url: str = "${LLM_BASE_URL}"
+    `model` and `base_url` are written in `config.toml`; only `api_key` comes
+    from `.env`. An empty `base_url` falls back to the official OpenAI endpoint.
+    """
+
+    model: str = ""
+    base_url: str = ""
     api_key: str = "${LLM_API_KEY}"
     temperature: float = 0.3
     max_tokens: int = 2048
     timeout: int = 60
 
     @property
+    def resolved_model(self) -> str | None:
+        return _resolve(self.model)
+
+    @property
     def resolved_base_url(self) -> str | None:
-        return None if _unresolved(self.base_url) else self.base_url
+        return _resolve(self.base_url)
 
     @property
     def resolved_api_key(self) -> str | None:
-        return None if _unresolved(self.api_key) else self.api_key
+        return _resolve(self.api_key)
 
 
 class EmbeddingConfig(BaseModel):
     """Kept separate from `llm` so the embedding gateway can differ."""
 
-    model: str = "${EMBED_MODEL}"
-    base_url: str = "${EMBED_BASE_URL}"
+    model: str = ""
+    base_url: str = ""
     api_key: str = "${EMBED_API_KEY}"
     # Conservative default; `embedding_client.embedding_batch_size()` clamps it
     # to `MAX_EMBED_BATCH`. Raise both if the gateway accepts larger batches.
     batch_size: int = 25
 
     @property
+    def resolved_model(self) -> str | None:
+        return _resolve(self.model)
+
+    @property
     def resolved_base_url(self) -> str | None:
-        return None if _unresolved(self.base_url) else self.base_url
+        return _resolve(self.base_url)
 
     @property
     def resolved_api_key(self) -> str | None:
-        return None if _unresolved(self.api_key) else self.api_key
+        return _resolve(self.api_key)
 
 
 class StoreConfig(BaseModel):

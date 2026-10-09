@@ -33,7 +33,7 @@ flowchart TB
 |:---|:---|:---|
 | `scripts/cli.py` | 命令行入口；装配依赖；管理生命周期 | 任何业务逻辑 |
 | `main.py` | 薄包装，转发到 `scripts.cli:main` | 同上 |
-| `src/config.py` | 读 `config.toml`，展开 `${VAR}`，Pydantic 校验 | 不做默认值兜底之外的推断 |
+| `src/config.py` | 读 `config.toml`，展开 `${VAR}`（凭据来自 `.env`），Pydantic 校验，把"未设置"收敛成 `None` | 不做默认值兜底之外的推断 |
 | `src/logger.py` | 配置 JSON Lines 日志（一次性） | 不做业务记录 |
 | `src/api/llm_client.py` | LLM 客户端工厂（模块级缓存单例） | 不关心 prompt |
 | `src/api/embedding_client.py` | embedding 客户端工厂 + 批量上限约束 | 不关心索引策略 |
@@ -218,6 +218,8 @@ async def _bot_login(self, token) -> None:
 | `message_scene.ext` | 是 `[]string`（元素形如 `msg_idx=123`），**不是 dict** | 逐项按 `=` 拆分；同时容忍它哪天变成 dict |
 | `timestamp` | RFC3339 字符串，可能缺失或畸形 | 解析失败**回退到 `datetime.now()`**，丢时间戳不该连消息一起丢 |
 | `msg_elements` | 递归嵌套（引用 / 合并转发）；正文常常不在 `content` 里 | 递归解析 + `MAX_ELEMENT_DEPTH=5` 防病态嵌套；`body()` 把子元素内容拼进来 |
+
+**落库的是 `body()` 而不是 `content`**：附件变成 `[图片 photo.jpg]` 这样的占位、语音取附件上的 `asr_refer_text` 转写、引用与合并转发的正文从 `msg_elements` 摊平。这一层"文本化"必须在**写入时**做——取数工具读的就是 `content` 列（`src/agent/tools.py` 的 `_render`），若存原始文本，引用 / 转发 / 纯图片消息在 prompt 里就是一行空白。逐字原文仍完整留在 `raw_json`（见 `DATA_MODEL.md` §2.6）。
 
 **@ 触发的判定**（`mentions_bot()`）：全量消息模式下 `content` 里的 @ 前缀**已被平台剥离**，所以正文分不出"是否被 @ 了"——`mentions` 里那个 `bot: true` 是唯一信号。判定只认 `bot` 布尔位，不比对 id（`mention.id` 是 OpenID，与 appid 无可比性）。
 
