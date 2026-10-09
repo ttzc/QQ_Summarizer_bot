@@ -101,6 +101,17 @@ class Attachment:
             asr_refer_text=getattr(obj, "asr_refer_text", None),
         )
 
+    def is_image(self) -> bool:
+        """Whether this attachment is an image (the M2 media pipeline's input).
+
+        Same two-spelling tolerance as `is_voice`: the official event page
+        enumerates the bare `image`, the wire delivers `image/jpeg` (verified
+        against the real corpus). `video/` and the no-transcript `voice`
+        explicitly do not qualify — media rows exist to be *seen*.
+        """
+        ct = (self.content_type or "").lower()
+        return ct == "image" or ct.startswith("image/")
+
     def is_voice(self) -> bool:
         """Whether this attachment is a voice message.
 

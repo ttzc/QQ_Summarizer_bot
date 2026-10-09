@@ -65,6 +65,7 @@ class SummarizerClient(botpy.Client):
         store: SQLStore,
         summarizer: SummarizerLike,
         wake_indexer: Callable[[], None] | None = None,
+        wake_media: Callable[[], None] | None = None,
         **kwargs: Any,
     ) -> None:
         # public_messages (1<<25) is the intent that carries group/C2C events,
@@ -77,6 +78,9 @@ class SummarizerClient(botpy.Client):
         self._store = store
         self._summarizer = summarizer
         self._wake_indexer = wake_indexer
+        # 图片落盘队列的拨铃（`MediaWorker.wake`）。同步段里它只是 set 一个
+        # Event——下载与视觉调用全部活在后台，回调里一分钱网络花销都没有。
+        self._wake_media = wake_media
         # `group_openid` → `time.monotonic()` of the last auto-summary *attempt*.
         # In memory only: a restart that finds the backlog still over the
         # threshold simply summarises once more, which costs one document.
@@ -222,6 +226,14 @@ class SummarizerClient(botpy.Client):
         # embedded — summaries are — so waking on every message would have the
         # indexer spin on traffic while finding nothing, and the one insert that
         # does need indexing (a new summary) would go unwoken. See `_store_summary`.
+        #
+        # The *media* wake is the mirror image: raw messages ARE its backlog, so
+        # a message carrying an image must ring it — but only image messages do,
+        # so ordinary traffic never touches the queue.
+        if self._wake_media is not None and any(
+            att.is_image() for att in record.attachments
+        ):
+            self._wake_media()
         return True
 
     def _store_summary(

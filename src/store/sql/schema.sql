@@ -61,3 +61,37 @@ CREATE TABLE IF NOT EXISTS summaries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sum_group_created ON summaries(group_openid, created_at);
+
+-- One row per *attachment occurrence* (M2, docs/MEDIA.md + DATA_MODEL §2.7):
+-- same bytes forwarded twice share one disk file (dedup on `sha256`), but each
+-- occurrence needs its own processing status and its own write-back anchor
+-- (`placeholder`). `media_id` is a uuid, not a content hash — same lesson as
+-- `summary_id`: a hash PK + INSERT OR IGNORE would silently swallow the second
+-- occurrence. The first 8 chars surface in message text as the `#短id` the
+-- `view_image` tool takes.
+CREATE TABLE IF NOT EXISTS media (
+    media_id      TEXT PRIMARY KEY,
+    message_id    TEXT NOT NULL REFERENCES group_messages(message_id) ON DELETE CASCADE,
+    group_openid  TEXT NOT NULL,             -- in-group view_image cross-group guard
+    placeholder   TEXT NOT NULL,             -- exact text stored in `content`, the replace anchor
+    url           TEXT,
+    content_type  TEXT,
+    filename      TEXT,
+    event_size    INTEGER,                   -- bytes as claimed by the event (pre-flight cap check)
+    width         INTEGER,
+    height        INTEGER,
+    -- pending → stored (terminal; the description is tool-side cache, not a state)
+    -- failed side branches: expired (download 4xx) / skipped (magic-byte or size)
+    --                        / failed (network/5xx, retries exhausted)
+    status        TEXT NOT NULL DEFAULT 'pending',
+    sha256        TEXT,                      -- hash of downloaded bytes = file name
+    path          TEXT,                      -- relative to [media].dir, e.g. "2026-10-10/<sha>.jpg"
+    description   TEXT,                      -- generic-view cache (focus answers are not stored)
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT
+);
+
+-- The worker's queue. A partial index keeps it tiny: done rows never re-enter.
+CREATE INDEX IF NOT EXISTS idx_media_pending ON media(status, created_at) WHERE status = 'pending';

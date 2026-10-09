@@ -45,15 +45,19 @@ The asymmetry is deliberate, and it is not symmetric the other way round:
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Sequence
 
 from langchain.tools import ToolRuntime, tool
 
 from src.config import config
 from src.logger import setup_logger
+from src.media.sniff import sniff_image
+from src.media.vision import describe_image
 from src.rag.retriever import SummaryIndex, group_label, speaker_of
 from src.store.sql_store import SQLStore
 
@@ -147,6 +151,10 @@ class BotContext:
     index: SummaryIndex
     scope: str = SCOPE_GROUP
     coverage: CoverageLog = field(default_factory=CoverageLog)
+    # Real vision calls spent by `view_image` in *this run*. Lives on the
+    # per-invocation context, so the cap resets by construction every summary —
+    # no registry, no TTL, nothing to leak.
+    views_used: int = 0
 
 
 def _render(
@@ -397,12 +405,99 @@ async def messages_across_groups(
     return _render(rows, show_group=True)
 
 
-GROUP_TOOLS = [current_time, recent_messages, messages_in_range, search_summaries]
-C2C_TOOLS = [current_time, search_summaries, list_groups, messages_across_groups]
+def _read_media_file(rel_path: str) -> bytes:
+    """按 `[media].dir / path` 读落盘图片。dir 在调用时解析——测试覆盖配置即生效。"""
+    return (config.media.dir_path / rel_path).read_bytes()
+
+
+@tool
+async def view_image(
+    media_ref: str,
+    focus: str = "",
+    *,
+    runtime: ToolRuntime[BotContext, dict],
+) -> str:
+    """查看一张已存图（图片附件）的内容。两个 scope 都可调用。
+
+    media_ref 是消息正文占位 `[图片 xxx.jpg #4d9f2a1c]` 里 # 后面的短 id。
+    **只在图对当前问题真正重要时才调**——看图花时间和调用额度。不带 focus
+    得到通用描述（首次看图会现场看并缓存，之后所有人都直接读到文本）；带
+    focus（例如"图里有没有提到上线时间"）得到针对性回答，不缓存。
+    """
+    ctx: BotContext = runtime.context
+    row = ctx.store.find_media(media_ref)
+    if row is None:
+        return "找不到这张图——请使用正文里 [图片 … #短id] 的短 id（至少 6 位十六进制）。"
+    # The short id is 8 hex characters; guessing one from another group is
+    # conceivable, so the group scope refuses instead of trusting luck.
+    if ctx.scope == SCOPE_GROUP and row["group_openid"] != ctx.group_openid:
+        return "无权查看其他群的图片。"
+    if row["status"] != "stored" or not row["path"]:
+        return f"这张图现在看不了（状态：{row['status']}）。"
+    if not focus.strip() and row["description"]:
+        return f"[图片描述] {row['description']}"
+    if ctx.views_used >= int(config.media.max_views):
+        return (
+            f"本次回答查看图片已达上限（{config.media.max_views} 张），"
+            "请基于已有信息作答。"
+        )
+    ctx.views_used += 1
+
+    try:
+        data = await asyncio.to_thread(_read_media_file, row["path"])
+    except OSError:
+        logger.warning("media 文件缺失", extra={"media_id": row["media_id"], "path": row["path"]})
+        return "这张图的文件缺失，看不了。"
+    sniffed = sniff_image(data)
+    if sniffed is None:
+        return "这张图的文件内容不是可查看的图片格式。"
+    _ext, mime = sniffed
+
+    prompt = (
+        f"{focus.strip()}\n（请结合图片回答；若图中有相关文字，请逐字引用。）"
+        if focus.strip()
+        else config.media.describe_prompt
+    )
+    try:
+        answer = await describe_image(data, mime, prompt)
+    except Exception as exc:  # noqa: BLE001 - 一次工具失败不拖垮整轮（同 messages_in_range 的约定）
+        logger.warning(
+            "view_image 视觉调用失败",
+            extra={"media_id": row["media_id"], "err": repr(exc)[:200]},
+        )
+        return f"这张图暂时看不了：{repr(exc)[:120]}"
+    if not answer:
+        return "模型对这张图没有返回内容。"
+
+    if not focus.strip():
+        # 通用描述缓存回写：只回写第一次，之后取数/检索直接看到文本、零调用。
+        # 带 focus 的定向回答不缓存——它只服务于这一次提问。
+        ctx.store.save_media_description(row["media_id"], answer)
+        return f"[图片描述] {answer}"
+    return f"[图片定向回答] {answer}"
+
+
+GROUP_TOOLS = [
+    current_time,
+    recent_messages,
+    messages_in_range,
+    search_summaries,
+    view_image,
+]
+C2C_TOOLS = [
+    current_time,
+    search_summaries,
+    list_groups,
+    messages_across_groups,
+    view_image,
+]
 
 # Tools that actually read stored data, as opposed to `current_time`, which only
 # tells the agent what time it is. Used by `Summarizer` to decide whether an
 # answer is grounded in anything — see `SummaryResult.storable`.
+# `view_image` is deliberately NOT in here: it reads a picture, not messages, so
+# it must not inflate the coverage bookkeeping nor make an image-only answer
+# "storable" on its own.
 DATA_TOOLS = frozenset(
     {
         "recent_messages",

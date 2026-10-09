@@ -40,11 +40,14 @@ flowchart TB
 | `src/bot/events.py` | 解析原始事件为 `GroupMessageRecord` | 不落库、不发消息 |
 | `src/bot/client.py` | `botpy.Client` 子类：注册解析器、落库、判触发（@ / 到量自动）、发起群问答与私聊问答、总结入库 | 不切分消息、不直接调 `post_group_message` |
 | `src/bot/sender.py` | 出站：分段、`msg_seq`、窗口降级、群/私聊分派、发送结果判定 | 不生成内容 |
-| `src/store/sql_store.py` | SQLite 读写（原文表 + 总结表 + 索引进度 + 自动总结的计数查询） | 不做向量相关的事 |
+| `src/store/sql_store.py` | SQLite 读写（原文表 + 总结表 + media 附件队列/状态 + 索引进度 + 自动总结的计数查询） | 不做向量相关的事；不做网络/视觉（那是 worker 与工具） |
 | `src/store/sql/schema.sql` | 表结构 DDL | — |
 | `src/rag/retriever.py` | Chroma collection 封装；**总结文档**构造；可选的群过滤检索 | 不决定何时索引 |
 | `src/rag/indexer.py` | 后台批量索引循环 + `drain()` | 不生成 embedding（委托 retriever） |
-| `src/agent/tools.py` | 两套工具集（`GROUP_TOOLS` / `C2C_TOOLS`）+ `BotContext` + `CoverageLog` | 不装配 agent |
+| `src/media/worker.py` | 后台图片抓取（M2）：pending → 下载 → 魔数/大小护栏 → 日期桶落盘；**零 LLM** | 不看图（`view_image` 的事）、不发消息 |
+| `src/media/vision.py` | 一次性看图调用（`view_image` 内部）：base64 user message，不进会话/checkpointer | 不缓存（回写是 store 的 `save_media_description`） |
+| `src/media/sniff.py` | 按真实字节判定图片格式（官方规则：不看文件名与 MIME） | 不做任何下载/模型调用 |
+| `src/agent/tools.py` | 两套工具集（`GROUP_TOOLS` / `C2C_TOOLS`，各含按需看图 `view_image`）+ `BotContext` + `CoverageLog` | 不装配 agent |
 | `src/agent/summarizer.py` | 装配两个 `create_agent`；线程记忆 LRU 与每线程串行锁；结果与覆盖范围提取；`store_summary()` 决策 | 不直接读库（走工具） |
 
 依赖方向是单向的，没有环：
@@ -219,7 +222,7 @@ async def _bot_login(self, token) -> None:
 | `timestamp` | RFC3339 字符串，可能缺失或畸形 | 解析失败**回退到 `datetime.now()`**，丢时间戳不该连消息一起丢 |
 | `msg_elements` | 递归嵌套（引用 / 合并转发）；正文常常不在 `content` 里 | 递归解析 + `MAX_ELEMENT_DEPTH=5` 防病态嵌套；`body()` 把子元素内容拼进来 |
 
-**落库的是 `body()` 而不是 `content`**：附件变成 `[图片 photo.jpg]` 这样的占位、语音取附件上的 `asr_refer_text` 转写、引用与合并转发的正文从 `msg_elements` 摊平。这一层"文本化"必须在**写入时**做——取数工具读的就是 `content` 列（`src/agent/tools.py` 的 `_render`），若存原始文本，引用 / 转发 / 纯图片消息在 prompt 里就是一行空白。逐字原文仍完整留在 `raw_json`（见 `DATA_MODEL.md` §2.6）。
+**落库的是 `body()` 而不是 `content`**：附件变成 `[图片 photo.jpg #短id]` 这样的占位（短 id 由 media 行同事务生成，是 `view_image` 的引用方式与回写锚点，M2）、语音取附件上的 `asr_refer_text` 转写（无转写为 `[语音（无转写）]`）、引用与合并转发的正文从 `msg_elements` 摊平。这一层"文本化"必须在**写入时**做——取数工具读的就是 `content` 列（`src/agent/tools.py` 的 `_render`），若存原始文本，引用 / 转发 / 纯图片消息在 prompt 里就是一行空白。逐字原文仍完整留在 `raw_json`（见 `DATA_MODEL.md` §2.6）。
 
 **@ 触发的判定**（`mentions_bot()`）：全量消息模式下 `content` 里的 @ 前缀**已被平台剥离**，所以正文分不出"是否被 @ 了"——`mentions` 里那个 `bot: true` 是唯一信号。判定只认 `bot` 布尔位，不比对 id（`mention.id` 是 OpenID，与 appid 无可比性）。
 
@@ -405,7 +408,7 @@ flowchart TB
 
 - **全量消息权限已验证可用**（2026-10-09 真机）：群主在手机 QQ 的群设置里把「机器人可获取的群聊消息范围」设为「获取群内全部消息」后，`GROUP_MESSAGE_CREATE` 正常下发 —— 收到非 @ 消息、引用消息（`message_type=103`）、图片与 QQ 表情，且 `author_name` 有真实昵称。**开关在群设置里，不在开放平台，也不需要审核**（官方事件页未给 UI 位置，见 `CLAUDE.md` §1.9）。未开该开关的部署仍是降级形态，只有 @ 消息（`on_group_at_message_create`）。
 - **C2C 通道**：`on_c2c_message_create` 与 `post_c2c_message` 均已上真机（2026-10-09），单段被动回复正常。**"C2C 最多 5 次被动回复"仍未获官方文档核实**——只有 5 分钟窗口是 docstring 确认的；超发预期会被 `SequenceNumberError` 优雅拦下，但未经实测。
-- **图片 / 语音未进入语义层**：图片在正文里只是 `[图片 <十六进制文件名>]` 占位（原始 URL 已随 `raw_json` 落库），语音只取 QQ 的转写文本，无转写时为 `[语音（无转写）]` 占位。多模态的接入点与前提（附件 URL 的时效性）见 `CLAUDE.md` §5.1，推进顺序见 `ROADMAP.md`。
+- **多模态现状（M1/M2 已实现）**：语音只取 QQ 的转写文本，无转写为 `[语音（无转写）]` 占位；图片由后台 `MediaWorker` 落盘（`data/media/<消息日期>/<sha256>`，对 `rkey` 限时签名的保险），agent 经 `view_image` **按需**看图、通用描述缓存回写。图片内容不再依赖外链寿命，但**没人看过就不会进语料**——与"只有总结过的话题可检索"同一条既有限制。方案见 `docs/MEDIA.md`，推进顺序见 `ROADMAP.md`（PDF/docx 仍是占位，M3/M4）。
 - **语义检索只覆盖已生成总结的话题**：既没被 @ 过、也没攒到阈值的讨论，`search_summaries` 找不到；原文仍可按时间取。这是 §4.3 的直接结果。
 - **私聊即全群可见（含原文）**：能私聊机器人的人可以检索**所有群**的总结与原始消息（含发言人昵称）。私聊通道由平台层决定谁有资格，应用层的收紧旋钮是 `[c2c] allowlist`；`on_ready` 在那条路敞开时打 warning。
 - **自动总结的节奏未上真机验证**：默认每群 200 条 / 冷却 1800 秒是估算值，真实群的消息密度差异很大。真机上只观察到过**跳过分支**（`本群已有总结在跑，跳过自动总结`，说明 `group_busy` 闸门有效），尚未真跑到一次真正的触发；`qqbot stats` 的「待总结」列与日志里的「触发自动总结」是调参依据。

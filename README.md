@@ -120,6 +120,7 @@ uv run qqbot run          # 启动机器人（长驻进程）
 | `uv run qqbot stats` | 查看各群消息数、总结数、已索引数，以及「距上次总结新增了多少条」（自动总结的触发依据） |
 | `uv run qqbot summaries [--group <openid>] [--limit N]` | 列出已入库的总结（这是知识库的真实内容），并标明每篇是**被 @ 触发**还是**自动生成** |
 | `uv run qqbot reindex [--reset]` | 把 SQLite 里的**总结**灌进向量库；`--reset` 先清空向量与索引标记再全量重建 |
+| `uv run qqbot media [--status pending] [--limit N]` | 图片附件的处理状态一览（M2，只读排查：谁在排队、谁已落盘、谁过期/失败及原因） |
 | `uv run qqbot ask "<指令>" [--group <openid>] [--all] [--save]` | **脱机**跑一次问答（不连 QQ）。`--all` 走私聊 scope 跨群检索总结与原文；`--save` 把这次回答作为总结入库 |
 
 全局加 `-v` / `--verbose` 可让日志同时输出到控制台（默认只写 `logs/app.log`）。
@@ -190,7 +191,7 @@ flowchart LR
 uv run pytest
 ```
 
-覆盖事件解析、SQLite 去重与时间范围查询、消息正文的文本化落库、总结入库与索引、回复分段（群 + 私聊）、agent 工具边界与跨群可见性（含伪造 `runtime`/`scope` 的越权尝试）、语音消息的 ASR 转写与无转写占位、以及自动总结的阈值 / 冷却 / 静默与通知 / 同群串行等 **39 项测试**，按主要功能分成 `tests/` 下六个文件（共享 fixtures 与假件在 `conftest.py`），全部脱机运行，不需要任何凭据；push / PR 到 main 由 GitHub Actions（`.github/workflows/ci.yml`）自动跑同一套。
+覆盖事件解析、SQLite 去重与时间范围查询、消息正文的文本化落库、图片管线（media 行随消息同事务、落盘/去重/失败分态、`view_image` 缓存与跨群拒绝）、总结入库与索引、回复分段（群 + 私聊）、agent 工具边界与跨群可见性（含伪造 `runtime`/`scope` 的越权尝试）、语音消息的 ASR 转写与无转写占位、以及自动总结的阈值 / 冷却 / 静默与通知 / 同群串行等 **51 项测试**，按主要功能分成 `tests/` 下七个文件（共享 fixtures 与假件在 `conftest.py`），全部脱机运行，不需要任何凭据；push / PR 到 main 由 GitHub Actions（`.github/workflows/ci.yml`）自动跑同一套。
 
 ---
 
@@ -207,7 +208,10 @@ uv run pytest
 ## 已知限制
 
 - **不补历史**：只总结机器人上线后收到的消息。官方没有拉取历史的接口，这是唯一可行方案。
-- **图片与语音目前只是文本占位**：图片在正文里记成 `[图片 <文件名>]`，而真机上的文件名是一串大写十六进制 ID（如 `6A3051F3…jpg`），**图片内容本身没有被理解**；语音只取 QQ 给的转写文本（`asr_refer_text`），没有转写时记成 `[语音（无转写）]` 占位——知道说过话，但不知道说了什么。不过**图片 URL 其实已经落库**（`raw_json` 里带 `url` / `content_type` / `width` / `height`），只是暂时没人读——多模态的推进顺序见 [`ROADMAP.md`](ROADMAP.md)（语音 ASR → 图片 → PDF → docx/ppt）。
+- **多模态的现状**（推进顺序与方案：[`ROADMAP.md`](ROADMAP.md) + [`docs/MEDIA.md`](docs/MEDIA.md)）：
+  - **语音（M1，已实现）**：只取 QQ 官方的 ASR 转写（`asr_refer_text`）渲染成 `[语音转写 …]`；没有转写时记 `[语音（无转写）]` 占位。不存音频文件——能读音频的全模态模型太贵。
+  - **图片（M2，已实现）**：字节由后台抓取到本地 `data/media/<消息日期>/<sha256>`（对 URL 限时签名的保险），正文占位带短 id；agent 觉得重要时才调 `view_image` 看图，通用描述缓存回写、第二次看零成本。**代价**：没人调用过 view_image 的图，内容不进语料——与"只有总结过的话题可检索"是同一条既有限制。
+  - **PDF / docx / ppt（M3/M4，未做）**：仍是文件占位。
 - **QQ 表情码不渲染**：`<faceType=6,faceId="0",ext="…">` 这类原始编码会原样进正文，模型看到的是编码而不是表情。
 - **语义检索只覆盖"已生成总结"的话题**：被 @ 触发或自动触发写成文档的那些，`search_summaries` 才查得到；还在阈值以下的讨论没有文档，但**原文仍在库里**，私聊可以用 `messages_across_groups` 按时间范围取到。这是"一次总结一篇文档"的必然结果。
 - **私聊可见面 = 所有群的总结 + 原文**：任何能私聊机器人的人都能检索**全部群**的总结**与聊天原文**（含发言人昵称），不只是结论。这是刻意的产品选择——私聊入口由平台层控制谁有资格，`config.toml` 的 `[c2c] allowlist` 是应用层兜底。**不要把这个机器人加进不该看全量消息的群**。

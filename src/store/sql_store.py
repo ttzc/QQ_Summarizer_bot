@@ -116,52 +116,110 @@ class SQLStore:
     # ---- writes -----------------------------------------------------------
 
     def insert_messages(self, records: Sequence["GroupMessageRecord"]) -> int:
-        """Insert messages, skipping duplicates. Returns the number actually stored."""
+        """Insert messages, skipping duplicates. Returns the number actually stored.
+
+        Image attachments also get `media` rows (M2) — in the *same* transaction
+        and only for messages that actually landed. That ordering is what makes
+        dedup free: a duplicate event inserts 0 message rows, so its attachment
+        occurrences never queue a second download of the same picture.
+        """
         if not records:
             return 0
-        rows = [
-            (
-                rec.message_id,
-                rec.event_id,
-                rec.group_openid,
-                rec.author_openid,
-                rec.author_name,
-                rec.member_role,
-                # `body()`, not `content`: the raw text is blank for quote
-                # (103) and merged-forward (102) messages, and the only text a
-                # voice message carries is its ASR transcript. Storing the raw
-                # column would make every one of those an empty line in the
-                # prompt. The verbatim payload stays in `raw_json`.
-                rec.body(),
-                rec.message_type,
-                rec.ts.isoformat(),
-                rec.msg_idx,
-                rec.ref_msg_idx,
-                int(bool(rec.attachments)),
-                json.dumps(rec.raw, ensure_ascii=False, default=str),
-                _now(),
-            )
-            for rec in records
-        ]
-        with self._conn:  # one transaction for the batch
-            before = self._conn.total_changes
-            self._conn.executemany(
-                """
-                INSERT OR IGNORE INTO group_messages (
-                    message_id, event_id, group_openid, author_openid, author_name,
-                    member_role, content, message_type, ts, msg_idx, ref_msg_idx,
-                    has_media, raw_json, ingested_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
-            inserted = self._conn.total_changes - before
-        if inserted != len(rows):
+        inserted = 0
+        with self._conn:  # one transaction for the whole batch
+            for rec in records:
+                # `body()`, not `content`: the raw text is blank for quote (103)
+                # and merged-forward (102) messages, and the only text a voice
+                # message carries is its ASR transcript. Storing the raw column
+                # would make every one of those an empty line in the prompt.
+                # The verbatim payload stays in `raw_json`.
+                content, media_rows = self._render_with_media(rec)
+                before = self._conn.total_changes
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO group_messages (
+                        message_id, event_id, group_openid, author_openid, author_name,
+                        member_role, content, message_type, ts, msg_idx, ref_msg_idx,
+                        has_media, raw_json, ingested_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        rec.message_id,
+                        rec.event_id,
+                        rec.group_openid,
+                        rec.author_openid,
+                        rec.author_name,
+                        rec.member_role,
+                        content,
+                        rec.message_type,
+                        rec.ts.isoformat(),
+                        rec.msg_idx,
+                        rec.ref_msg_idx,
+                        int(bool(rec.attachments)),
+                        json.dumps(rec.raw, ensure_ascii=False, default=str),
+                        _now(),
+                    ),
+                )
+                if self._conn.total_changes == before:
+                    continue  # duplicate message: no media rows either
+                inserted += 1
+                if media_rows:
+                    self._conn.executemany(
+                        """
+                        INSERT INTO media (
+                            media_id, message_id, group_openid, placeholder,
+                            url, content_type, filename, event_size, width, height,
+                            status, attempts, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)
+                        """,
+                        media_rows,
+                    )
+        if inserted != len(records):
             logger.debug(
                 "duplicate messages skipped",
-                extra={"submitted": len(rows), "inserted": inserted},
+                extra={"submitted": len(records), "inserted": inserted},
             )
         return inserted
+
+    @staticmethod
+    def _render_with_media(rec: "GroupMessageRecord") -> tuple[str, list[tuple]]:
+        """`body()` with image placeholders rewritten to carry `#短id` + media rows.
+
+        The new label is *both* the text the model calls `view_image` with and
+        the write-back anchor stored in `placeholder` — the anchor must be the
+        exact string written now, not something recomputed later (labels evolve).
+        Two attachments with an identical label are handled by replacing one
+        occurrence each, in order.
+        """
+        content = rec.body()
+        media_rows: list[tuple] = []
+        for att in rec.attachments:
+            if not att.is_image():
+                continue
+            media_id = uuid.uuid4().hex
+            short = media_id[:8]
+            label = att.label()
+            new_label = f"{label[:-1]} #{short}]" if label.endswith("]") else f"{label} #{short}]"
+            if label in content:
+                content = content.replace(label, new_label, 1)
+            else:  # body() somehow did not carry this label — keep the anchor real
+                content = f"{content} {new_label}".strip()
+            media_rows.append(
+                (
+                    media_id,
+                    rec.message_id,
+                    rec.group_openid,
+                    new_label,
+                    att.url,
+                    att.content_type,
+                    att.filename,
+                    att.size,
+                    att.width,
+                    att.height,
+                    _now(),
+                )
+            )
+        return content, media_rows
 
     def insert_summary(
         self,
@@ -229,6 +287,146 @@ class SQLStore:
             before = self._conn.total_changes
             self._conn.execute("UPDATE summaries SET indexed_at = NULL")
             return self._conn.total_changes - before
+
+    # ---- media (M2：图片落盘与按需查看) ------------------------------------
+    # 管线见 docs/MEDIA.md，列语义见 DATA_MODEL §2.7。和全类一样的规矩：这里
+    # 只有同步 SQL，下载与视觉调用都活在 store 之外（worker / view_image 工具）。
+
+    def pending_media(self, limit: int) -> list[sqlite3.Row]:
+        """后台 Worker 的队列，最旧优先。
+
+        带上 `message_ts`：落盘目录的日期桶取**消息发送日期**而非处理日期，
+        跨天重试也落回原桶（MEDIA.md D1）。
+        """
+        cursor = self._conn.execute(
+            """
+            SELECT m.*, gm.ts AS message_ts
+            FROM media m JOIN group_messages gm ON gm.message_id = m.message_id
+            WHERE m.status = 'pending'
+            ORDER BY datetime(m.created_at) ASC, m.rowid ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return cursor.fetchall()
+
+    def mark_media_stored(self, media_id: str, sha256: str, path: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE media SET status='stored', sha256=?, path=?, last_error=NULL, updated_at=?
+                WHERE media_id=?
+                """,
+                (sha256, path, _now(), media_id),
+            )
+
+    def bump_media_attempt(self, media_id: str, error: str) -> None:
+        """可重试失败（网络/5xx）。是否转 `failed` 由 worker 判——只有它知道配置的
+        `attempts_max`，store 只记次数。"""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE media SET attempts = attempts + 1, last_error = ?, updated_at = ? WHERE media_id = ?",
+                (error[:200], _now(), media_id),
+            )
+
+    def note_media_failure(self, media_id: str, status: str, note: str | None = None) -> None:
+        """终态（expired / skipped / failed），并把可见说明换进消息正文。
+
+        取数里写明这张图看不了，模型就不会去调一个必然失败的工具。`replace()`
+        会替换**所有**相同标签——同一消息里两张同名图同归于此，罕见且可接受。
+        """
+        row = self._conn.execute(
+            "SELECT message_id, placeholder FROM media WHERE media_id = ?", (media_id,)
+        ).fetchone()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE media SET status=?, last_error=?, updated_at=? WHERE media_id=?",
+                (status, (note or "")[:200] or None, _now(), media_id),
+            )
+            if row is not None and note:
+                self._conn.execute(
+                    "UPDATE group_messages SET content = replace(content, ?, ?) WHERE message_id=?",
+                    (row["placeholder"], note, row["message_id"]),
+                )
+
+    def find_media(self, ref: str) -> sqlite3.Row | None:
+        """按（短）id 找一行 media —— 前缀匹配，最旧优先。
+
+        至少 6 位的要求是**准确性**护栏（短前缀撞库），不是安全护栏；真正的
+        安全是 `view_image` 拿着行做群校验。
+        """
+        ref = (ref or "").lstrip("#").strip().lower()
+        if len(ref) < 6 or not all(c in "0123456789abcdef" for c in ref):
+            return None
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM media WHERE media_id LIKE ? || '%'
+            ORDER BY datetime(created_at) ASC, rowid ASC LIMIT 1
+            """,
+            (ref,),
+        )
+        return cursor.fetchone()
+
+    def find_media_path_by_sha(self, sha256: str) -> str | None:
+        """同一字节内容的已有落点（D1 全局去重：跨天转发/跨日期桶都不复制文件）。"""
+        row = self._conn.execute(
+            "SELECT path FROM media WHERE sha256 = ? AND path IS NOT NULL LIMIT 1",
+            (sha256,),
+        ).fetchone()
+        return row["path"] if row else None
+
+    def save_media_description(self, media_id: str, description: str) -> bool:
+        """缓存通用描述，并把消息正文里的占位换成 `[图片 …：描述]`。
+
+        两者同事务；media 侧 UPDATE 带 `description IS NULL` 守卫——守卫的
+        rowcount 就是幂等锁：只有第一个把描述带回来的调用会做正文替换。
+        """
+        clean = " ".join(str(description).split())[:300]
+        if not clean:
+            return False
+        row = self._conn.execute(
+            "SELECT message_id, placeholder FROM media WHERE media_id = ?", (media_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        placeholder = row["placeholder"]
+        new_label = (
+            f"{placeholder[:-1]}：{clean}]"
+            if str(placeholder).endswith("]")
+            else f"{placeholder}：{clean}"
+        )
+        with self._conn:
+            before = self._conn.total_changes
+            self._conn.execute(
+                """
+                UPDATE media SET description=?, updated_at=? WHERE media_id=? AND description IS NULL
+                """,
+                (clean, _now(), media_id),
+            )
+            if self._conn.total_changes == before:
+                return False  # 另一路 view 已抢先缓存
+            self._conn.execute(
+                "UPDATE group_messages SET content = replace(content, ?, ?) WHERE message_id = ?",
+                (placeholder, new_label, row["message_id"]),
+            )
+        return True
+
+    def media_rows(self, status: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+        """`qqbot media` 的列表；按请求的状态取，最旧优先。"""
+        if status in (None, "", "all"):
+            cursor = self._conn.execute(
+                "SELECT * FROM media ORDER BY datetime(created_at) ASC, rowid ASC LIMIT ?",
+                (limit,),
+            )
+        else:
+            cursor = self._conn.execute(
+                """
+                SELECT * FROM media WHERE status = ?
+                ORDER BY datetime(created_at) ASC, rowid ASC LIMIT ?
+                """,
+                (status, limit),
+            )
+        return cursor.fetchall()
 
     # ---- reads ------------------------------------------------------------
 
@@ -399,7 +597,10 @@ class SQLStore:
                    g.first_ts,
                    g.last_ts,
                    COALESCE(s.summaries, 0) AS summaries,
-                   COALESCE(s.indexed, 0)   AS indexed
+                   COALESCE(s.indexed, 0)   AS indexed,
+                   COALESCE(m.pending, 0)   AS media_pending,
+                   COALESCE(m.stored, 0)    AS media_stored,
+                   COALESCE(m.described, 0) AS media_described
             FROM (
                 SELECT group_openid,
                        COUNT(*)  AS total,
@@ -415,6 +616,14 @@ class SQLStore:
                 FROM summaries
                 GROUP BY group_openid
             ) AS s ON s.group_openid = g.group_openid
+            LEFT JOIN (
+                SELECT group_openid,
+                       SUM(status = 'pending')      AS pending,
+                       SUM(status = 'stored')       AS stored,
+                       SUM(description IS NOT NULL) AS described
+                FROM media
+                GROUP BY group_openid
+            ) AS m ON m.group_openid = g.group_openid
             ORDER BY g.total DESC
             """
         )

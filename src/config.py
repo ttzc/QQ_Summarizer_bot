@@ -206,6 +206,36 @@ class C2CConfig(BaseModel):
     raw_limit: int = 200
 
 
+class MediaConfig(BaseModel):
+    """图片落盘与按需查看（M2，docs/MEDIA.md）。
+
+    后台 `MediaWorker` 只负责把图片字节尽快抓到本地（这是对 `rkey` 限时签名的
+    唯一防御）；"看图"本身发生在 `view_image` 工具里，一次调用、结果缓存。
+    `enabled = false` 时 Worker 不启动，但 media 行照常入库——队列在库里，
+    以后打开开关即补跑。
+    """
+
+    enabled: bool = True
+    dir: str = "data/media"          # 根目录；内部按消息发送日期分桶 YYYY-MM-DD/
+    batch: int = 10                  # Worker 每批处理的 pending 行数
+    max_bytes: int = 33_554_432      # 32 MiB；先按 event_size 预判，下载后按真实字节复核
+    attempts_max: int = 3            # 网络/5xx 重试上限，超过转 failed
+    download_timeout_s: int = 30
+    interval_s: int = 15             # 无唤醒时的兜底轮询间隔
+    backoff_s: int = 60              # 一批失败后的退避
+    # 每次 agent 运行（一个 BotContext）允许 view_image 真实调用视觉模型的上限。
+    # 防的是模型逐图上瘾把 5 分钟被动回复窗口吃光；计数在 ctx 上，天然按轮重置。
+    max_views: int = 6
+    detail: str = "low"              # 官方档位：low 缩到 512×512，摘要够用且省 token
+    describe_prompt: str = (
+        "描述这张图片：先说主体内容，再逐字转写图中出现的文字。2-4 句中文。"
+    )
+
+    @property
+    def dir_path(self) -> Path:
+        return _resolve_path(self.dir)
+
+
 class LoggingConfig(BaseModel):
     level: str = "INFO"
     dir: str = "logs"
@@ -223,6 +253,7 @@ class AppConfig(BaseModel):
     summary: SummaryConfig = SummaryConfig()
     c2c: C2CConfig = C2CConfig()
     auto_summary: AutoSummaryConfig = AutoSummaryConfig()
+    media: MediaConfig = MediaConfig()
     logging: LoggingConfig = LoggingConfig()
     # Optional `[groups]` section: `group_openid` → a human name, used in
     # retrieved document text and answers. QQ exposes no way to resolve the name.

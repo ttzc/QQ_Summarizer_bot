@@ -111,7 +111,7 @@ detail              = "low"          # 看图调用一律缩到 512×512，摘�
 
 图片文件与 `media` 表不进任何检索路径（`search_summaries` 检索的仍是总结文本）。模型对图的唯一入口是 `view_image`，群内 scope 下受注入的 `group_openid` 硬校验（步骤 2）；返回的是文字，与取数工具同等对待，天然被既有预算与隔离规则覆盖。
 
-## 验收清单（脱机，`tests/test_media.py`）
+## 验收清单（脱机，`tests/test_media.py` — 2026-10-10 起全部落地，套件 51 项）
 
 假件注入：`http_get`（下载器）与 `describe`（一次性视觉调用），真 SQLite + 真文件写入（tmp_path）。
 

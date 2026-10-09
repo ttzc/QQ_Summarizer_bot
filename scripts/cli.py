@@ -74,6 +74,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_reindex.set_defaults(handler=_cmd_reindex)
 
+    p_media = sub.add_parser("media", help="列出图片附件的处理状态（M2，只读排查）")
+    p_media.add_argument(
+        "--status",
+        default="pending",
+        help="pending / stored / expired / skipped / failed / all（默认 pending）",
+    )
+    p_media.add_argument("--limit", type=int, default=20)
+    p_media.set_defaults(handler=_cmd_media)
+
     p_ask = sub.add_parser("ask", help="脱机跑一次问答（不连 QQ，需要真实 LLM 凭据）")
     p_ask.add_argument("instruction", help="要问的话，例如“总结最近 50 条”")
     p_ask.add_argument("--group", help="群 openid；库里只有一个群时可省略")
@@ -96,6 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _cmd_run(args: argparse.Namespace) -> int:
     from src.agent.summarizer import Summarizer
     from src.bot.client import SummarizerClient
+    from src.media.worker import MediaWorker
     from src.rag.indexer import SummaryIndexer
     from src.rag.retriever import get_summary_index
     from src.store.sql_store import get_sql_store
@@ -119,11 +129,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     store = get_sql_store()
     index = get_summary_index()
     indexer = SummaryIndexer(store, index)
+    media_worker = MediaWorker(store)
     summarizer = Summarizer(store, index)
     client = SummarizerClient(
         store=store,
         summarizer=summarizer,
         wake_indexer=indexer.wake,
+        wake_media=media_worker.wake,
         # bot_log=True keeps botpy logging on the root logger (so its warnings and
         # trace_ids land in our JSON log); ext_handlers=False stops it from also
         # writing a `botpy.log` file into the CWD.
@@ -137,13 +149,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # when there is no running loop. Here it finds one, so the deprecated path
         # is never taken — no need for the pre-emptive `set_event_loop` dance.
         async with client:
-            background = asyncio.create_task(indexer.run_forever(), name="indexer")
+            # 两条后台循环：总结→向量（indexer），消息→图片落盘（media）。
+            # 都是"SQLite 里躺着积压、wake 只是拨铃"的形态，崩了重启自然续跑。
+            background = [
+                asyncio.create_task(indexer.run_forever(), name="indexer"),
+                asyncio.create_task(media_worker.run_forever(), name="media"),
+            ]
             try:
                 await client.start(appid, secret)
             finally:
-                background.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await background
+                for task in background:
+                    task.cancel()
+                for task in background:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
 
     logger.info("机器人启动", extra={"appid": appid, "sandbox": config.qq.is_sandbox})
     try:
@@ -166,16 +185,20 @@ def _cmd_stats(args: argparse.Namespace) -> int:
 
     print(
         f"{'群 openid':<28} {'消息数':>8} {'总结':>6} {'已索引':>7} {'待总结':>7} "
-        f"{'首条':<20} {'末条':<20}"
+        f"{'图片(待/存/述)':>14} {'首条':<20} {'末条':<20}"
     )
     for row in rows:
         # "Messages since this group's last summary" — the number the auto
         # trigger compares against its threshold, so it is also the number to
         # look at when wondering whether `min_messages` is set right.
         pending = store.messages_since_last_summary(row["group_openid"])
+        # 图片三格：待抓取 / 已落盘 / 已有描述缓存（M2，docs/MEDIA.md）。
+        media_cell = (
+            f"{row['media_pending']}/{row['media_stored']}/{row['media_described']}"
+        )
         print(
             f"{row['group_openid']:<28} {row['total']:>8} {row['summaries']:>6} "
-            f"{row['indexed']:>7} {pending:>7} "
+            f"{row['indexed']:>7} {pending:>7} {media_cell:>14} "
             f"{str(row['first_ts'])[:19]:<20} {str(row['last_ts'])[:19]:<20}"
         )
     if store.unindexed_summaries(limit=1):
@@ -243,6 +266,30 @@ def _cmd_reindex(args: argparse.Namespace) -> int:
 
     total = asyncio.run(drain())
     print(f"索引完成：本次写入 {total} 篇，集合内共 {index.count()} 篇。")
+    store.close()
+    return 0
+
+
+def _cmd_media(args: argparse.Namespace) -> int:
+    """图片附件处理状态一览（只读）。删文件=删语料，所以这里没有删除动词。"""
+    from src.store.sql_store import get_sql_store
+
+    store = get_sql_store()
+    rows = store.media_rows(args.status, limit=max(1, args.limit))
+    if not rows:
+        print(f"没有状态为 {args.status!r} 的图片附件。")
+        store.close()
+        return 0
+    for row in rows:
+        short = row["media_id"][:8]
+        name = row["filename"] or "(无名)"
+        tail = row["path"] or row["last_error"] or ""
+        mark = "已看图" if row["description"] else ""
+        print(
+            f"[{short}] {row['status']:<8} {name} · {row['group_openid'][:12]}… "
+            f"· 第 {row['attempts']} 次 {mark} {tail}"
+        )
+    print(f"\n共 {len(rows)} 行（status={args.status}）。")
     store.close()
     return 0
 

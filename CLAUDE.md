@@ -10,7 +10,7 @@ QQ 群消息总结机器人：接入 QQ 官方机器人（群聊能力）接收�
 
 ## 项目现状
 
-**实现已完成（脱机可验证部分）**：脱机测试套件（pytest **39 项**，`tests/` 按主要功能分文件）全绿。未完成的只剩真机联调（见 §五）。
+**实现已完成（脱机可验证部分）**：脱机测试套件（pytest **51 项**，`tests/` 按主要功能分文件）全绿。未完成的只剩真机联调（见 §五）。
 
 ```mermaid
 flowchart LR
@@ -29,8 +29,9 @@ flowchart LR
     SRC --- SL["logger.py<br/>JSON Lines 日志"]
     SRC --- SA["api/<br/>llm_client / embedding_client（缓存单例）"]
     SRC --- SB["bot/<br/>events.py / client.py / sender.py"]
-    SRC --- SS["store/<br/>sql_store.py + sql/schema.sql（原文表 + 总结表）"]
+    SRC --- SS["store/<br/>sql_store.py + sql/schema.sql（原文表 + 总结表 + media 附件表）"]
     SRC --- SR["rag/<br/>indexer.py（写）/ retriever.py（读）"]
+    SRC --- SM["media/<br/>worker.py（图片落盘，零 LLM）/ vision.py（按需看图一次性调用）/ sniff.py（魔数）"]
     SRC --- SG["agent/<br/>tools.py（GROUP_TOOLS / C2C_TOOLS）/ summarizer.py"]
 ```
 
@@ -588,7 +589,7 @@ flowchart TB
 
 | 层 | 位置 | 存什么 | 谁写 |
 |:---|:---|:---|:---|
-| SQLite | `data/qqbot.db` | 原文全量 `group_messages`（`content` 列存的是**文本化正文**，逐字原文在 `raw_json`）+ 总结全量 `summaries`（`indexed_at IS NULL` 即索引进度） | `on_group_message_create`（同步、快）；总结入库 |
+| SQLite | `data/qqbot.db` | 原文全量 `group_messages`（`content` 列存的是**文本化正文**，图片占位带 `#短id`，逐字原文在 `raw_json`）+ 总结全量 `summaries`（`indexed_at IS NULL` 即索引进度）+ `media` 附件队列/状态（`DATA_MODEL` §2.7） | `on_group_message_create`（同步、快，消息与 media 行同事务）；总结入库；后台 `MediaWorker`（落盘）；`view_image`（描述缓存） |
 | Chroma | `data/chroma_db/` | **一篇总结一个**向量文档（collection `summaries`） | 后台 indexer（批量、慢） |
 | 内存 | `InMemorySaver` | agent 多轮会话状态 | `Summarizer`，LRU 128 条线程（群 + 私聊共享） |
 
@@ -659,7 +660,7 @@ flowchart TB
 
 ## 五、待办 / 下一步
 
-**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI —— 见 §项目现状，脱机测试（pytest **39 项**）全绿。
+**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结 + media 附件表）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI、**M1 语音 ASR 入库**、**M2 图片落盘 + `view_image` 按需看图**（方案 `docs/MEDIA.md`，表 `DATA_MODEL` §2.7）—— 见 §项目现状，脱机测试（pytest **51 项**）全绿。
 
 **剩余（按能否脱机划分为两类）**：
 
@@ -676,10 +677,11 @@ flowchart TB
 - [ ] 真机验证被动回复的**边界**：`msg_seq` 递增（>1 段）、单条消息 5 次上限的实际行为、5 分钟窗口的降级（转主动消息）。目前只发出过单段。
 - [ ] 真机验证**自动总结真的触发一次**：需要该群攒到 `min_messages`（默认 200）条新消息，或临时把阈值调小；`notify = true` 时还需群主开「机器人主动在群聊内发言」，否则那条主动消息发不出去。
 - [ ] 真机验证**跨群原文检索**：私聊问"把这两天的原始消息列出来"，确认 `messages_across_groups` 的时间边界与 `raw_limit` 在真实网关上表现正常。
+- [ ] 真机验证 **M2 图片管线**：第一条真实图片走完 `pending → stored`（日期桶命名、魔数判定的真机形态）；一次 @ 总结中模型主动调 `view_image` 的全链路（含描述回写与缓存命中）；隔天重放离线积压的 pending，验证 `expired` 是否需要配人工重放。语音的 `asr_refer_text` 覆盖率观察同批处理（当前语料尚无语音消息）。
 
-### 5.1 下一步：多模态（图片 / 语音）
+### 5.1 多模态（图片 / 语音）—— M1/M2 已实现，本节保留选型与实测记录
 
-现状：图片与语音都只是**文本占位**，没有进入语义层。
+**状态（2026-10-10）**：M1（语音 ASR 入库）与 M2（图片落盘 + `view_image` 按需看图 + 描述缓存）已按 `docs/MEDIA.md` 实现，脱机 51 项全绿；真机观察项见 §五。下面的"现状"描述的是 M2 之前的形态，保留作为模型选型与实测依据（其中"URL 时效待定"已被 M2 的落盘策略解耦）。M3（PDF）/ M4（docx/ppt）未动工。
 
 - 图片在 `Attachment.label()`（`events.py:89`）里渲染成 `[图片 <filename>]`，而真机的 `filename` 是一串大写十六进制 + 扩展名（形如 `6A3051F3….jpg`），**信息量≈0**。
 - 语音取 `asr_refer_text`（官方文档名"语音消息 ASR **参考**结果"——名字本身不承诺必有），渲染成 `[语音转写 …]`；**没有转写渲染成 `[语音（无转写）]`**（M1，2026-10-09 已实现）——让摘要至少知道这里说过一次话。语音判定认 `content_type` 的 `voice` 与 `audio/*`（官方 2026-09-16 版事件页的枚举就是裸词 `voice`，同页却称该列为"MIME 类型"，图片实际以 `image/jpeg` 到线，故两边都收）；**`message_type` 不可用**——官方没有语音专属值，且官方自己的图片示例与真机库都是 `message_type: 0`。官方 MessageAttachment 另有 **`voice_wav_url`**（QQ 已完成 SILK→WAV 转换，URL 与图片同款 `rkey` 签名结构）：按"音频不入库"的取舍**不解析**，但随逐字 `raw_json` 原样保留，日后想用便宜的原生音频模型时反悔成本为零。⚠️ botpy 1.2.1 的 `_Attachments` **不解析** `asr_refer_text`（site-packages 全文零命中），所以 @ 退路上语音恒进无转写分支；`Attachment.from_object` 已按 `getattr` 读取该字段，SDK 哪天补上即自动生效。真机观察（覆盖率/长度/风格）待第一条语音落库——当前语料语音消息为 0 条（2026-10-09 清点 `data/qqbot.db`，带附件的 5 条全是图片）。多模态的完整计划（含"不存音频文件：能读音频的全模态模型太贵"这条既定取舍）见 [`ROADMAP.md`](ROADMAP.md)。

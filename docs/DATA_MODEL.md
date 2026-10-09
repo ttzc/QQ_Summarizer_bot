@@ -49,7 +49,7 @@ PRAGMA busy_timeout=5000     # 万一有第二个进程，不立即 SQLITE_BUSY
 | `author_openid` | TEXT | 发言者标识（匿名化，非 QQ 号） |
 | `author_name` | TEXT | 发言人**昵称**——botpy 的 `GroupMessage` 会丢掉，本项目从原始 `d` 里取回 |
 | `member_role` | TEXT | `member` / `admin` / `owner` |
-| `content` | TEXT | 正文的**文本形态**：原始文本 + 附件占位（`[图片 photo.jpg]`）+ 语音转写 + 引用 / 合并转发的元素正文。**不是逐字原文**——逐字的在 `raw_json`（见 §2.6） |
+| `content` | TEXT | 正文的**文本形态**：原始文本 + 附件占位（图片为 `[图片 photo.jpg #短id]`，`#` 后是 media 短 id，M2）+ 语音转写（或 `[语音（无转写）]`）+ 引用 / 合并转发的元素正文。看过/失败的图片占位会被原位替换成 `[图片 …：描述]` / `[图片 …：已过期]`（§2.7）。**不是逐字原文**——逐字的在 `raw_json`（见 §2.6） |
 | `message_type` | INTEGER | 0 文本 / 3 卡片 / 101 并行 / 102 聊天记录 / 103 引用 |
 | `ts` | TEXT NOT NULL | ISO8601 |
 | `msg_idx` | TEXT | 来自 `message_scene.ext` |
@@ -153,7 +153,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
 - **`msg_elements` 不单独建表**。引用 / 合并转发的嵌套内容在事件解析阶段被摊平成文本写进 `content`，结构本身不留存；要支持"展开某条合并转发"得改这里。
 - **`raw_json` 目前无消费者**。它保证即使解析逻辑有遗漏，原始数据也没丢，未来可以据此回填（例如按上面的取舍回填旧行）。
 
-### 2.7 `media` — 图片附件表（M2 规划中，随实现生效）
+### 2.7 `media` — 图片附件表（M2，已实现）
 
 一条**附件出现**一行（不是一张去重后的图）：同图被多人转发时共享同一个磁盘文件（按 `sha256` 复用 `path`），但每次出现都有自己的处理状态、短 id 与回写锚点。方案的动机与管线见 `MEDIA.md`；本节只管表结构。
 
@@ -166,7 +166,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
 | `url` / `filename` / `content_type` / `event_size` / `width` / `height` | — | 事件原始信息。`event_size` 在下载前先做超限预判 |
 | `status` | TEXT NOT NULL | `pending`（默认）→ `stored`（终态，等工具按需取用）；失败分态 `expired`（下载 4xx，签名失效，不耗 LLM）/ `skipped`（魔数不在白名单 / 超限）/ `failed`（网络/5xx 重试耗尽） |
 | `sha256` | TEXT | 下载字节的哈希 = 存储文件名。已登记过即复用旧 `path`（跨天转发、跨日期桶都不复制文件） |
-| `path` | TEXT | 相对 `data/` 的落盘路径：`media/YYYY-MM-DD/<sha256>.<ext>`。日期 = **消息发送日期**（跨天重试也落回原桶），桶由首次入库决定 |
+| `path` | TEXT | 相对 `[media].dir` 的落盘路径：`YYYY-MM-DD/<sha256>.<ext>`（绝对路径 = `dir / path`，工具在调用时解析配置，便于测试沙箱）。日期 = **消息发送日期**（跨天重试也落回原桶），桶由首次入库决定 |
 | `description` | TEXT | 通用描述的**缓存**（`view_image` 无 focus 调用产出）。带 focus 的定向回答不落这里 |
 | `attempts` / `last_error` | INTEGER / TEXT | 重试簿记 |
 | `created_at` / `updated_at` | TEXT | 入库 / 状态变更时刻 |
@@ -183,7 +183,7 @@ CREATE INDEX idx_media_pending ON media(status, created_at) WHERE status = 'pend
 group_messages.content   "15:03 小红: 看这个 [图片 6A3051F3.jpg #4d9f2a1c]"
         │ 取数工具把整行喂给模型；模型想看图 →
         ▼
-media (media_id LIKE '4d9f2a1c%')   status=stored, path=media/2026-10-10/e3b0c4….jpg
+media (media_id LIKE '4d9f2a1c%')   status=stored, path=2026-10-10/e3b0c4….jpg
         │ view_image 读文件 → 一次性视觉调用 →
         ▼
 磁盘 data/media/2026-10-10/e3b0c4….jpg          ← 字节，与 rkey 寿命无关

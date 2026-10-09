@@ -167,10 +167,12 @@ def test_tool_sets_and_privacy_direction() -> None:
     c2c_by_name = {t.name: t for t in C2C_TOOLS}
     assert set(group_by_name) == {
         "current_time", "recent_messages", "messages_in_range", "search_summaries",
-    }, "群内工具集是那 4 个"
+        "view_image",
+    }, "群内工具集是那 5 个"
     assert set(c2c_by_name) == {
         "current_time", "search_summaries", "list_groups", "messages_across_groups",
-    }, "私聊工具集是那 4 个"
+        "view_image",
+    }, "私聊工具集是那 5 个"
     # The two sets exist precisely because these two lines must both hold.
     assert "list_groups" not in group_by_name, "群内工具集没有跨群能力"
     assert "messages_across_groups" not in group_by_name, "群内工具集读不到别群的原文"
@@ -184,6 +186,12 @@ def test_tool_sets_and_privacy_direction() -> None:
         "recent_messages", "messages_in_range", "search_summaries", "messages_across_groups"
     } == set(DATA_TOOLS), "所有取数工具都登记在 DATA_TOOLS 里"
     assert "current_time" not in DATA_TOOLS, "current_time 不算取数工具"
+    # view_image 读的是图不是消息：不该进 coverage 记账，也不该让"只看了一张图"
+    # 的回答自动构成文档。
+    assert "view_image" not in DATA_TOOLS, "view_image 不算取数工具"
+    assert "view_image" in group_by_name and "view_image" in c2c_by_name, (
+        "两个 scope 都能按需看图（跨群由行级校验拦，不由工具集拦）"
+    )
 
 
 def test_injected_args_invisible_to_model() -> None:

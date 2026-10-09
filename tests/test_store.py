@@ -33,7 +33,8 @@ def test_messages_insert_dedupe_and_read(store) -> None:
     # 空白、图片消息的文字全在附件上，直接存原始值会让这些消息在 prompt 里
     # 变成一行空白。原文（原始 d）仍完整留在 raw_json。
     by_id = {row["message_id"]: row for row in recent}
-    assert "[图片 photo.jpg]" in by_id["ROBOT1.0_image"]["content"], "图片消息的附件标签落库"
+    # M2 之后图片占位带 `#短id`（view_image 的引用方式），断言跟着形态走。
+    assert "[图片 photo.jpg #" in by_id["ROBOT1.0_image"]["content"], "图片消息的附件占位落库"
     assert "明天有空吗" in by_id["ROBOT1.0_quote"]["content"], "引用消息的引用正文落库"
     assert "[语音转写" in by_id["ROBOT1.0_voice"]["content"], "语音消息的 ASR 转写落库"
     assert "message_scene" in by_id["ROBOT1.0_quote"]["raw_json"], "原文仍保留在 raw_json"

@@ -81,6 +81,21 @@ raw_limit = 200  # 私聊取原文一次最多返回多少条
 # QQ 没有任何接口能把 group_openid 解析成群名，不配就只能显示 openid 尾号。
 # "<group_openid>" = "公司群"
 
+[media]
+# 图片的落盘与按需查看（M2，方案见 docs/MEDIA.md、表结构见 docs/DATA_MODEL.md §2.7）。
+# Worker 只下载落盘（零 LLM）；看图发生在 view_image 工具里，通用描述缓存回写。
+enabled      = true
+dir          = "data/media"   # 内部按消息发送日期分桶 data/media/YYYY-MM-DD/
+batch        = 10
+max_bytes    = 33554432       # 32 MiB
+attempts_max = 3
+download_timeout_s = 30
+interval_s   = 15
+backoff_s    = 60
+max_views    = 6              # 每次 agent 运行允许 view_image 真实调用视觉模型的上限
+detail       = "low"
+describe_prompt = "描述这张图片：先说主体内容，再逐字转写图中出现的文字。2-4 句中文。"
+
 [logging]
 level = "INFO"
 dir   = "logs"
