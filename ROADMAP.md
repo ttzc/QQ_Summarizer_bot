@@ -41,7 +41,7 @@
 
 现状：图片只渲染成 `[图片 <十六进制串>.jpg]`，信息量≈0（CLAUDE.md §5.1）。库里已经有 `url`，只是没人读。
 
-方案骨架：**落盘解决时效，按需看图解决语义**（定稿细节全部在 MEDIA.md）——**2026-10-10 脱机实现完成**，套件 51 项全绿（本次投稿改造后为 72 项）。
+方案骨架：**落盘解决时效，按需看图解决语义**（定稿细节全部在 MEDIA.md）——**2026-10-10 脱机实现完成**，套件 51 项全绿（本次投稿改造后为 78 项）。
 
 - [x] `data/media/YYYY-MM-DD/<sha256>.<ext>` 本地存图（`src/media/worker.py`）：按**消息发送日期**分桶，内容哈希全局去重（已登记即复用旧 path；tmp+rename 原子写盘）。URL 时效就此降级：队列分钟级排空 ≪ 实测 17 分钟有效期。
 - [x] `media` 表（DATA_MODEL §2.7；一行 = 一次附件出现，uuid 主键 + 哈希列文件去重；pending → stored 终态，失败分态 expired / skipped / failed）+ `MediaWorker` 只落盘、零 LLM；`insert_messages` 同事务插行去重免费；占位嵌 8 位短 id：`[图片 xx.jpg #a1b2c3d4]`。

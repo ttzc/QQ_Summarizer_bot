@@ -250,8 +250,10 @@ async def _bot_login(self, token) -> None:
 
 **决策**：两套工具集、两个 `create_agent` 图，共享同一个模型与同一个 checkpointer。
 
-- `GROUP_TOOLS = current_time / recent_messages / messages_in_range / search_summaries / view_image / summaries_in_range / get_summary / save_summary`（8 个），其中 `search_summaries` 与 `summaries_in_range` 恒带群过滤。**群 agent 的工具集里没有跨群工具，一个都没有。** 反过来，投稿能力也只在这里：私聊拿不到 `save_summary`。
-- `C2C_TOOLS = current_time / search_summaries / list_groups / messages_across_groups / view_image`（5 个），其中 `search_summaries` 不带过滤。
+- `GROUP_TOOLS = current_time / recent_messages / messages_in_range / search_summaries / view_image / summaries_in_range / get_summary / save_summary / changelog`（9 个），其中 `search_summaries` 与 `summaries_in_range` 恒带群过滤。**群 agent 的工具集里没有跨群工具，一个都没有。** 反过来，投稿能力也只在这里：私聊拿不到 `save_summary`。
+- `C2C_TOOLS = current_time / search_summaries / list_groups / messages_across_groups / view_image / changelog`（6 个），其中 `search_summaries` 不带过滤。
+
+`changelog` 是**唯一两边都有的非取数工具**：它读的是本项目的更新记录（路径是模块常量，模型不能指定文件——旁边就是装着 `clientSecret` 与 api key 的 `.env`），不属于任何群，所以既不构成跨群面，也不进 `coverage`（只读过它的一轮不许投稿）。
 
 **为什么不用一个 agent + 运行时 `if ctx.scope`**：`create_agent` 在构造期绑定工具，单个 agent 必须**持有**跨群工具，安全就退化成"每次调用都记得检查 scope"——正是 `tools.py` 的设计要消除的那类 bug。拆成两个图之后，群 agent 的图里**根本不存在**跨群能力。
 

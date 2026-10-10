@@ -11,8 +11,13 @@ from __future__ import annotations
 import warnings
 from typing import get_origin
 
+import pytest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, ToolMessage
+
+# Imported as a module because the tool reads `CHANGELOG_PATH` at call time, so
+# tests can point it at a fixture file instead of the repo's own document.
+from src.agent import tools as tools_module
 
 from conftest import FakeEmbeddings, TEXT_MESSAGE, frame
 from src.agent.summarizer import (
@@ -30,6 +35,7 @@ from src.agent.tools import (
     SCOPE_GROUP,
     BotContext,
     CoverageLog,
+    changelog,
     get_summary,
     list_groups,
     messages_across_groups,
@@ -40,7 +46,7 @@ from src.agent.tools import (
     summaries_in_range,
 )
 from src.bot.events import GroupMessageRecord
-from src.config import config
+from src.config import PROJECT_ROOT, config
 from src.rag.retriever import SummaryIndex, group_label
 
 # The third group is a realistic 32-char openid and deliberately has **no
@@ -176,12 +182,17 @@ def test_tool_sets_and_privacy_direction() -> None:
     c2c_by_name = {t.name: t for t in C2C_TOOLS}
     assert set(group_by_name) == {
         "current_time", "recent_messages", "messages_in_range", "search_summaries",
-        "view_image", "summaries_in_range", "get_summary", "save_summary",
-    }, "群内工具集是那 8 个"
+        "view_image", "summaries_in_range", "get_summary", "save_summary", "changelog",
+    }, "群内工具集是那 9 个"
     assert set(c2c_by_name) == {
         "current_time", "search_summaries", "list_groups", "messages_across_groups",
-        "view_image",
-    }, "私聊工具集是那 5 个（投稿与库内自查都不给私聊：答复横跨多群，没有归属地）"
+        "view_image", "changelog",
+    }, "私聊工具集是那 6 个（投稿与库内自查都不给私聊：答复横跨多群，没有归属地）"
+    # `changelog` is the one tool that legitimately spans both: it reads our own
+    # repository, which belongs to no group and leaks nothing.
+    assert "changelog" in group_by_name and "changelog" in c2c_by_name, (
+        "自述能力两边都有——它不碰任何群的数据"
+    )
     # The two sets exist precisely because these two lines must both hold.
     assert "list_groups" not in group_by_name, "群内工具集没有跨群能力"
     assert "messages_across_groups" not in group_by_name, "群内工具集读不到别群的原文"
@@ -708,6 +719,151 @@ async def test_get_summary_reads_one_document_by_short_id(store, tmp_path) -> No
         config.summary.max_doc_reads = monkeypatch_reads
 
     assert capped.context.coverage.intervals() == [], "读正文不进包络（同上一条测试的理由）"
+
+
+# ---- the bot reading its own change log --------------------------------------
+
+CHANGELOG_FIXTURE = """# Changelog
+
+说明行：日期即版本。
+
+- ⚠️ 测试计数换过单位。
+
+---
+
+## 2026-10-10 — 最新的一节
+
+### Added
+
+- 甲功能
+- 乙功能
+
+---
+
+## 2026-10-09 — 中间的一节
+
+- 丙改动
+
+---
+
+## 2026-01-01 — 最早的一节
+
+- 丁初始
+"""
+
+
+@pytest.fixture()
+def changelog_file(tmp_path, monkeypatch):
+    path = tmp_path / "CHANGELOG.md"
+    path.write_text(CHANGELOG_FIXTURE, encoding="utf-8")
+    monkeypatch.setattr(tools_module, "CHANGELOG_PATH", path)
+    return path
+
+
+async def test_changelog_returns_recent_sections_only(changelog_file) -> None:
+    out = await changelog.coroutine(sections=2, runtime=_RT("G_demo"))
+    assert "最新的一节" in out and "中间的一节" in out
+    assert "最早的一节" not in out, "默认只回最近几节，不是整份文件"
+    assert "共 3 个日期节" in out and "sections 调大" in out, "必须说清还剩多少节"
+    assert "换过单位" in out, "文件头的阅读说明要保留（日期不是群聊时间）"
+
+
+async def test_changelog_clamps_and_degrades(changelog_file, tmp_path, monkeypatch) -> None:
+    big = await changelog.coroutine(sections=999, runtime=_RT("G_demo"))
+    assert "最早的一节" in big, "sections 超上限时取到上限（不是报错也不是只给 1 节）"
+    assert "共 3 个日期节" not in big, "取满了就不必再说还剩多少"
+
+    missing = tmp_path / "absent.md"
+    monkeypatch.setattr(tools_module, "CHANGELOG_PATH", missing)
+    out = await changelog.coroutine(runtime=_RT("G_demo"))
+    assert "没有可读的更新记录" in out, "文件不存在时给一句实话，不抛异常"
+
+    nodate = tmp_path / "flat.md"
+    nodate.write_text("# 只有标题没有 ## 节\n\n正文若干。", encoding="utf-8")
+    monkeypatch.setattr(tools_module, "CHANGELOG_PATH", nodate)
+    out = await changelog.coroutine(runtime=_RT("G_demo"))
+    assert "未能按日期分节" in out, "分不出节时回退到原文开头，而不是答'没有'"
+
+
+async def test_changelog_survives_one_oversized_section(
+    tmp_path, monkeypatch
+) -> None:
+    """一个日期节自己就比预算长时，也要给出东西，而不是答"只列最近 0 节"。
+
+    changelog 只会一节节变长，所以这不是假想情形。静默交出空清单会被模型读成
+    "没有更新记录"，那比截断更糟。
+    """
+    from src.agent.tools import MAX_TOOL_CHARS
+
+    huge = tmp_path / "huge.md"
+    huge.write_text(
+        "# Changelog\n\n头。\n\n## 2026-10-10 — 巨大的一节\n\n"
+        + "很长。" * MAX_TOOL_CHARS
+        + "\n\n## 2026-01-01 — 小的一节\n\n短。\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tools_module, "CHANGELOG_PATH", huge)
+    out = await changelog.coroutine(sections=3, runtime=_RT("G_demo"))
+    assert "巨大的一节" in out, "至少给出最新一节的开头"
+    assert "已截断" in out, "并说明被截断了"
+    assert "只列最近 0 节" not in out, "不能交出'零节'这种读起来像'没有'的答案"
+    assert len(out) <= MAX_TOOL_CHARS + 4000, "仍然受预算约束（头 + 截断标记）"
+
+
+async def test_changelog_exposes_no_file_locator() -> None:
+    """🔴 The credential guard.
+
+    `.env` beside the code holds the QQ clientSecret and two API keys, and the
+    model reads text written by whoever joins the group. If this tool could take a
+    path, a message like "帮我看下 .env 第三行" becomes a leak — so the only
+    argument is a *size*, and that has to stay true.
+    """
+    visible = set(changelog.tool_call_schema.model_fields)
+    assert visible == {"sections"}, f"changelog 只能有 sections 参数，实得 {visible}"
+    internal = set(changelog.get_input_schema().model_fields)
+    assert "runtime" in internal and "runtime" not in visible, "runtime 由服务端注入"
+    for forbidden in ("path", "file", "filename", "name", "doc", "target", "query"):
+        assert forbidden not in internal, f"不得存在 {forbidden} 参数（可越权读文件）"
+
+
+async def test_changelog_read_does_not_ground_a_document(changelog_file) -> None:
+    """Consulting our own docs is not reading the group — so it cannot publish.
+
+    A run that only read the change log would otherwise be able to submit a
+    document whose coverage and provenance have nothing to do with the group it
+    gets filed under.
+    """
+    rt = _RT("G_demo", store=None, index=None)
+    await changelog.coroutine(sections=1, runtime=rt)
+    assert rt.context.coverage.is_empty(), "读更新记录不进 coverage"
+    out = await save_summary.coroutine(content=LONG_DOC, runtime=rt)
+    assert "没有读过任何" in out, "因此也不能凭它投稿"
+    assert "changelog" not in DATA_TOOLS, "它不算取数工具"
+
+
+async def test_real_changelog_matches_what_the_parser_prompts(
+    tmp_path, monkeypatch
+) -> None:
+    """Run the tool against the repo's actual CHANGELOG.md.
+
+    The tool's docstring promises "最近的几个日期节", which depends on the file's
+    own convention (newest date first, one `## ` per dated section). That
+    convention lives in a document humans edit by hand, so it is worth pinning:
+    a reordered or re-headed file makes the tool answer "最近" wrongly, silently.
+    """
+    real = PROJECT_ROOT / "CHANGELOG.md"
+    if not real.exists():
+        pytest.skip("仓库里没有 CHANGELOG.md")
+    monkeypatch.setattr(tools_module, "CHANGELOG_PATH", real)
+    out = await changelog.coroutine(sections=1, runtime=_RT("G_demo"))
+
+    preamble, sections = tools_module._split_sections(real.read_text(encoding="utf-8"))
+    assert len(sections) >= 2, "真实文件应已按日期分节"
+    dates = [h.split("—")[0].replace("## ", "").strip() for h, _ in sections]
+    assert dates == sorted(dates, reverse=True), f"日期节必须新在前，实得 {dates}"
+    first = sections[0][0]
+    assert first in out and sections[-1][0] not in out, "默认只回最近一节"
+    assert "测试计数" in preamble or "日期即版本" in preamble, "文件头在第一个 ## 之前"
 
 
 # ---- real agent runs (ToolNode injection, end to end) ------------------------

@@ -10,7 +10,7 @@ QQ 群消息总结机器人：接入 QQ 官方机器人（群聊能力）接收�
 
 ## 项目现状
 
-**实现已完成（脱机可验证部分）**：脱机测试套件（pytest **72 项**，`tests/` 按主要功能分文件）全绿。未完成的只剩真机联调（见 §五）。
+**实现已完成（脱机可验证部分）**：脱机测试套件（pytest **78 项**，`tests/` 按主要功能分文件）全绿。未完成的只剩真机联调（见 §五）。
 
 ```mermaid
 flowchart LR
@@ -617,8 +617,9 @@ flowchart TB
 
 `create_agent` 在构造期绑定工具，所以：
 
-- `GROUP_TOOLS = current_time / recent_messages / messages_in_range / search_summaries / view_image / summaries_in_range / get_summary / save_summary`（共 8 个；检索与库内自查恒带群过滤；**没有**任何跨群能力）。
-- `C2C_TOOLS = current_time / search_summaries / list_groups / messages_across_groups / view_image`（共 5 个；检索不过滤；`messages_across_groups` 按时间范围跨群读**原文**；**没有投稿工具**，见 §4.1.1）。
+- `GROUP_TOOLS = current_time / recent_messages / messages_in_range / search_summaries / view_image / summaries_in_range / get_summary / save_summary / changelog`（共 9 个；检索与库内自查恒带群过滤；**没有**任何跨群能力）。
+- `C2C_TOOLS = current_time / search_summaries / list_groups / messages_across_groups / view_image / changelog`（共 6 个；检索不过滤；`messages_across_groups` 按时间范围跨群读**原文**；**没有投稿工具**，见 §4.1.1）。
+- `changelog` 两边都有（唯一非取数、跨 scope 的自述工具）：**路径是模块常量，模型不能指定文件**——代码旁边就是装着 `clientSecret` 和 api key 的 `.env`，能吃文件名的工具等于把群聊文本变成凭据外泄通道。它不进 `DATA_TOOLS`、不进 `coverage`，所以只读过它的一轮**不能投稿**。
 - 投稿工具摘不掉但可以被闸：`BotContext.allow_publish`（私聊与离线 `ask`（无 `--save`）都是 False）。工具在构造期绑定，所以"这一轮能不能写"只能挂在按引用传出的 context 上。
 - `DATA_TOOLS` 含读库两个工具（它们确实读了存库数据，漏登记会让 `Summarizer._run` 的告警对诚实回答狂响），但**不含** `save_summary`（写不是读）。
 
@@ -667,7 +668,7 @@ flowchart TB
 
 ## 五、待办 / 下一步
 
-**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结 + media 附件表）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI、**M1 语音 ASR 入库**、**M2 图片落盘 + `view_image` 按需看图**（方案 `docs/MEDIA.md`，表 `DATA_MODEL` §2.7）、**入库决定权交给 agent**（`save_summary` 投稿 + `summaries_in_range`/`get_summary` 自查，§4.1.1；2026-10-10，零结构变更）—— 见 §项目现状，脱机测试（pytest **72 项**）全绿。
+**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结 + media 附件表）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI、**M1 语音 ASR 入库**、**M2 图片落盘 + `view_image` 按需看图**（方案 `docs/MEDIA.md`，表 `DATA_MODEL` §2.7）、**入库决定权交给 agent**（`save_summary` 投稿 + `summaries_in_range`/`get_summary` 自查，§4.1.1；2026-10-10，零结构变更）—— 见 §项目现状，脱机测试（pytest **78 项**）全绿。
 
 **剩余（按能否脱机划分为两类）**：
 
@@ -694,7 +695,7 @@ flowchart TB
 
 ### 5.1 多模态（图片 / 语音）—— M1/M2 已实现，本节保留选型与实测记录
 
-**状态（2026-10-10）**：M1（语音 ASR 入库）与 M2（图片落盘 + `view_image` 按需看图 + 描述缓存）已按 `docs/MEDIA.md` 实现，脱机 72 项全绿；真机观察项见 §五。下面的"现状"描述的是 M2 之前的形态，保留作为模型选型与实测依据（其中"URL 时效待定"已被 M2 的落盘策略解耦）。M3（PDF）/ M4（docx/ppt）未动工。
+**状态（2026-10-10）**：M1（语音 ASR 入库）与 M2（图片落盘 + `view_image` 按需看图 + 描述缓存）已按 `docs/MEDIA.md` 实现，脱机 78 项全绿；真机观察项见 §五。下面的"现状"描述的是 M2 之前的形态，保留作为模型选型与实测依据（其中"URL 时效待定"已被 M2 的落盘策略解耦）。M3（PDF）/ M4（docx/ppt）未动工。
 
 - 图片在 `Attachment.label()`（`events.py:89`）里渲染成 `[图片 <filename>]`，而真机的 `filename` 是一串大写十六进制 + 扩展名（形如 `6A3051F3….jpg`），**信息量≈0**。
 - 语音取 `asr_refer_text`（官方文档名"语音消息 ASR **参考**结果"——名字本身不承诺必有），渲染成 `[语音转写 …]`；**没有转写渲染成 `[语音（无转写）]`**（M1，2026-10-09 已实现）——让摘要至少知道这里说过一次话。语音判定认 `content_type` 的 `voice` 与 `audio/*`（官方 2026-09-16 版事件页的枚举就是裸词 `voice`，同页却称该列为"MIME 类型"，图片实际以 `image/jpeg` 到线，故两边都收）；**`message_type` 不可用**——官方没有语音专属值，且官方自己的图片示例与真机库都是 `message_type: 0`。官方 MessageAttachment 另有 **`voice_wav_url`**（QQ 已完成 SILK→WAV 转换，URL 与图片同款 `rkey` 签名结构）：按"音频不入库"的取舍**不解析**，但随逐字 `raw_json` 原样保留，日后想用便宜的原生音频模型时反悔成本为零。⚠️ botpy 1.2.1 的 `_Attachments` **不解析** `asr_refer_text`（site-packages 全文零命中），所以 @ 退路上语音恒进无转写分支；`Attachment.from_object` 已按 `getattr` 读取该字段，SDK 哪天补上即自动生效。真机观察（覆盖率/长度/风格）待第一条语音落库——当前语料语音消息为 0 条（2026-10-09 清点 `data/qqbot.db`，带附件的 5 条全是图片）。多模态的完整计划（含"不存音频文件：能读音频的全模态模型太贵"这条既定取舍）见 [`ROADMAP.md`](ROADMAP.md)。

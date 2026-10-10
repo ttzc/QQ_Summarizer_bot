@@ -56,7 +56,7 @@ from typing import Any, Sequence
 from langchain.tools import ToolRuntime, tool
 
 from src.agent.publish import insert_document
-from src.config import config
+from src.config import PROJECT_ROOT, config
 from src.logger import setup_logger
 from src.media.sniff import sniff_image
 from src.media.vision import describe_image
@@ -546,6 +546,110 @@ async def view_image(
     return f"[图片定向回答] {answer}"
 
 
+# ---- the bot's own change log ------------------------------------------------
+
+# 🔴 A module constant, not a tool argument. The model must never be able to name
+# a file: `.env` next to the code holds the QQ `clientSecret` and two API keys, and
+# the model reads group messages written by whoever is in the room. A `path` or
+# `file` parameter would turn "帮我看下 .env 第三行" into a credential leak. So the
+# only knob is *how many sections*, which is a size argument, not a locator.
+CHANGELOG_PATH: Path = PROJECT_ROOT / "CHANGELOG.md"
+CHANGELOG_SECTIONS_MAX = 10
+# The header block before the first `## ` carries the file's own reading
+# instructions ("日期即版本 / 测试计数换过单位"), which is exactly what a caller
+# needs to interpret the dates below. Kept short by budget rather than dropped.
+CHANGELOG_PREAMBLE_CHARS = 1200
+
+
+def _split_sections(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Split a markdown document into `(preamble, [(heading, body), ...])`.
+
+    Level-2 headings (`## `) are the unit, which is what CHANGELOG.md's own
+    convention makes a date section. Deliberately not a regex over dates: the
+    format of a heading is a human's business, and a date parser would just turn a
+    reflowed heading into a silently empty answer.
+    """
+    preamble: list[str] = []
+    sections: list[tuple[str, list[str]]] = []
+    for line in text.splitlines():
+        if line.startswith("## "):
+            sections.append((line, []))
+        elif sections:
+            sections[-1][1].append(line)
+        else:
+            preamble.append(line)
+    return (
+        "\n".join(preamble).strip(),
+        [(heading, "\n".join(body).strip()) for heading, body in sections],
+    )
+
+
+@tool
+async def changelog(
+    sections: int = 3,
+    *,
+    runtime: ToolRuntime[BotContext, dict],
+) -> str:
+    """读本机器人**自己的**更新记录（CHANGELOG.md）最近的几个日期节。
+
+    用于"最近新增了什么功能""这个 bug 什么时候修的""哪次改动动了表结构"这类
+    关于机器人本身的问题。它读的不是群聊内容：返回的日期不是群里讨论的时间，
+    回答里要说清这是开发记录。
+
+    sections = 想要几节（1-10，默认 3）。一节 = 文件里一个 `## 日期 — 标题`。
+    **没有文件参数**，路径是写死的，只能读这一份。
+    """
+    # `runtime` is declared and unused, exactly like `current_time`: the injected
+    # argument is what keeps every tool's schema shaped the same way for
+    # ToolNode's stripping, and a test asserts that shape for all of them.
+    try:
+        text = CHANGELOG_PATH.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        # A deployment that ships the code without the repo's docs still answers
+        # group questions; this tool just has nothing to say about itself.
+        return "（没有可读的更新记录文件，回答不了关于本项目改动的问题）"
+
+    wanted = max(1, min(int(sections), CHANGELOG_SECTIONS_MAX))
+    preamble, all_sections = _split_sections(text)
+    if not all_sections:
+        # No `## ` heading matched: fall back to the raw head of the file rather
+        # than answering "nothing here" when the file plainly exists.
+        body = " ".join(text.split())[:MAX_TOOL_CHARS]
+        return f"（未能按日期分节，以下为原文开头）{body}" if body else "（更新记录是空的）"
+
+    parts = [preamble[:CHANGELOG_PREAMBLE_CHARS]] if preamble else []
+    taken = len("\n\n".join(parts))
+    shown = 0
+    for heading, body in all_sections:
+        chunk = f"{heading}\n{body}" if body else heading
+        if taken + len(chunk) > MAX_TOOL_CHARS:
+            break
+        parts.append(chunk)
+        taken += len(chunk) + 2
+        shown += 1
+        if shown >= wanted:
+            break
+    if shown == 0:
+        # A single section larger than the whole budget (a changelog grows one
+        # release at a time; this day arrives). Answering "只列最近 0 节" would read
+        # as "there is nothing", so hand back the head of the newest section and
+        # say it was cut.
+        heading, body = all_sections[0]
+        room = max(0, MAX_TOOL_CHARS - len("\n\n".join(parts)) - 40)
+        chunk = f"{heading}\n{body}"[:room]
+        parts.append(chunk + "\n……（本节过长，已截断）")
+        shown = 1
+    omitted = len(all_sections) - shown
+    if omitted > 0:
+        parts.append(
+            f"……（本文件共 {len(all_sections)} 个日期节，此处只列最近 {shown} 节；"
+            "需要更早的请把 sections 调大）"
+        )
+    # Reading about ourselves is not reading the group: nothing here belongs in
+    # `ctx.coverage`, so a run that only consulted the log stays un-storable.
+    return "\n\n".join(parts)
+
+
 def _label_of(instruction: Any) -> str:
     """The one-line "what is this document" for a listing.
 
@@ -755,6 +859,7 @@ GROUP_TOOLS = [
     summaries_in_range,
     get_summary,
     save_summary,
+    changelog,
 ]
 C2C_TOOLS = [
     current_time,
@@ -762,6 +867,7 @@ C2C_TOOLS = [
     list_groups,
     messages_across_groups,
     view_image,
+    changelog,
 ]
 
 # Tools that put material into the coverage log — as opposed to `current_time`
@@ -773,7 +879,11 @@ C2C_TOOLS = [
 # data, and a run that consulted the library must not trip that warning. Their
 # entries carry `envelope=False`, so they widen "was this grounded" without
 # touching the time window — which is the whole point of the split in `add`.
-# `save_summary` is a writer, not a reader, so it is not here.
+# `save_summary` is a writer, not a reader, and `changelog` reads *our own* docs
+# rather than anything from a group — so neither belongs here. The second one is
+# load-bearing: leaving `changelog` out is what keeps a run that only consulted
+# the change log un-storable, instead of letting it publish "a document" whose
+# grounding has nothing to do with the group it is filed under.
 DATA_TOOLS = frozenset(
     {
         "recent_messages",
