@@ -336,10 +336,26 @@ def _cmd_ask(args: argparse.Namespace) -> int:
         store.close()
         return 2
 
-    result = asyncio.run(summarizer.summarize_group(group, args.instruction))
+    # `--save` is what opens the publishing gate for this run: the agent here is
+    # the *same* object the bot uses, and its tools are bound at construction, so
+    # the only per-call way to stop a hand-run query from writing documents is
+    # `allow_publish=False`. Without it the model may still *ask* to publish and
+    # be told no.
+    result = asyncio.run(
+        summarizer.summarize_group(
+            group, args.instruction, allow_publish=bool(args.save)
+        )
+    )
     print(result.text)
 
-    if args.save:
+    if result.published:
+        # The model published on its own (only possible with --save, per above).
+        print(
+            f"\n（agent 投稿入库 {len(result.published_ids)} 篇："
+            f"{'、'.join(i[:8] for i in result.published_ids)}；"
+            "运行 `qqbot reindex` 建索引。）"
+        )
+    elif args.save:
         summary_id = store_summary(
             store,
             group_openid=group,
@@ -350,7 +366,10 @@ def _cmd_ask(args: argparse.Namespace) -> int:
         if summary_id:
             print(f"\n（已入库 {summary_id}，运行 `qqbot reindex` 建索引。）")
         else:
-            print("\n（这次回答不构成可入库的总结：没有取数，或内容过短。）")
+            print(
+                "\n（这次回答不构成可入库的总结：没有取数，或内容过短；"
+                "模型自己也没有调用 save_summary。）"
+            )
     store.close()
     return 0
 

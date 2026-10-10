@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -35,6 +35,7 @@ from src.agent.tools import (
     BotContext,
     CoverageLog,
 )
+from src.agent.publish import insert_document
 from src.api.llm_client import get_chat_model
 from src.config import PROJECT_ROOT
 from src.logger import setup_logger
@@ -117,24 +118,43 @@ def _tools_called(messages: Sequence[BaseMessage]) -> set[str]:
 
 @dataclass(slots=True)
 class SummaryResult:
-    """One answer, plus what it was based on."""
+    """One answer, plus what it was based on and what it published."""
 
     text: str
     coverage: CoverageLog
+    # Filled from the injected context after the run: what `save_summary` wrote
+    # *during* it, if anything. The caller uses this to decide whether to wake
+    # the indexer, and the auto path uses `published_text` (not `text`) when it
+    # pushes a summary to the group.
+    published_ids: list[str] = field(default_factory=list)
+    published_text: str = ""
+
+    @property
+    def published(self) -> bool:
+        return bool(self.published_ids)
 
     def storable(self) -> bool:
-        """Is this answer a knowledge document, or just a conversational turn?
+        """Is this answer fit to be stored **on code's initiative**?
+
+        This is no longer the gate for the `@` path — the model publishes there
+        through the `save_summary` tool, and its judgement is the one that
+        matters. This method now only serves the two places where *code* decides,
+        because nobody is asking the model to: the auto-summary fallback (the
+        model ran on a fixed instruction and may not have published) and the
+        offline `ask --save`.
 
         All three conditions are required:
 
         * not the `NO_ANSWER` sentinel and long enough to carry content;
         * **at least one data tool actually ran.**
 
-        The last one is the point. The group agent is conversational (a memory
-        keyed per group), so a second @ in the same group may be a follow-up —
-        "那再补充一下" — answered entirely from the previous turns with zero tool
-        calls. That is a fine reply but not a standalone document, and storing it
-        would fill the corpus with text that has no coverage window at all.
+        The floor here is deliberately `MIN_DOC_CHARS` (30), far below
+        `config.summary.min_publish_chars` (200) that the tool enforces. Raising
+        it would be the tempting tidy-up and a real bug: the auto trigger counts
+        messages *since the last stored row*, so a thin-but-successful summary
+        that refuses to be stored leaves that count unreset, and the next message
+        after the cooldown re-summarises the very same batch — every cooldown,
+        forever. Better one thin document than an infinite loop of LLM calls.
         """
         text = self.text.strip()
         if text == NO_ANSWER or len(text) < MIN_DOC_CHARS:
@@ -156,19 +176,25 @@ def store_summary(
     result: SummaryResult,
     trigger: str = "at",
 ) -> str | None:
-    """Persist `result` as a document if it qualifies. Returns its id, or None.
+    """Write `result.text` as a document, if code is entitled to write it at all.
 
-    Deliberately outside `Summarizer`: deciding *whether* to keep an answer is
-    the caller's business, not the agent's. The bot stores every qualifying group
-    answer; the offline `ask` command only does when told to.
+    The **fallback** writer, used only where nobody asked the model to publish:
+    the auto-summary path when its run produced nothing via `save_summary`, and
+    the offline `ask --save`. The `@` path no longer comes through here — the
+    model publishes there itself, mid-run, through the tool.
 
-    `trigger` records what produced the document — someone summoning the bot
-    (`"at"`) or the message-count trigger (`"auto"`) — so the corpus can be
-    audited for how much of it the bot wrote on its own initiative.
+    `result.published` short-circuits it. Without that check a model that
+    published during an auto run would leave *two* rows for one summary: its own,
+    plus this one carrying the same coverage. That is not hypothetical once the
+    tool exists — the auto instruction literally says "请总结本群最近的讨论", so
+    the model has every reason to publish.
     """
+    if result.published:
+        return None
     if not result.storable():
         return None
-    return store.insert_summary(
+    return insert_document(
+        store,
         group_openid=group_openid,
         instruction=instruction,
         content=result.text,
@@ -275,9 +301,27 @@ class Summarizer:
     # ---- entry points -----------------------------------------------------
 
     async def summarize_group(
-        self, group_openid: str, instruction: str
+        self,
+        group_openid: str,
+        instruction: str,
+        *,
+        requested_by: str | None = None,
+        trigger: str = "at",
+        allow_publish: bool = True,
     ) -> SummaryResult:
-        """Answer `instruction` using only this group's messages."""
+        """Answer `instruction` using only this group's messages.
+
+        The three keyword arguments are **provenance for `save_summary`**: the
+        requester, which entry point this turn came from, and whether publishing
+        is allowed at all. They ride on the injected context rather than the tool
+        signature for the same reason `group_openid` does — a model that could
+        name a requester or a `trigger` would eventually invent one, and the
+        audit column would stop meaning anything.
+
+        `allow_publish=False` exists because the offline `ask` command runs this
+        very agent: tools are bound at construction, so the only per-call way to
+        keep a hand-run query from writing documents is a gate on the context.
+        """
         return await self._run(
             agent=self._group_agent,
             thread_key=group_thread_key(group_openid),
@@ -287,11 +331,21 @@ class Summarizer:
                 store=self._store,
                 index=self._index,
                 scope=SCOPE_GROUP,
+                instruction=instruction,
+                requested_by=requested_by,
+                trigger=trigger,
+                allow_publish=allow_publish,
             ),
         )
 
     async def answer_private(self, user_openid: str, instruction: str) -> SummaryResult:
-        """Answer a private-chat message from the summaries of every group."""
+        """Answer a private-chat message from the summaries of every group.
+
+        Publishing is off here by design: a private answer spans groups, and
+        `summaries.group_openid` is NOT NULL — there is no honest owner for such a
+        document. It is derived from summaries too, so keeping it would start a
+        chain of summaries-of-summaries.
+        """
         return await self._run(
             agent=self._c2c_agent,
             thread_key=f"U:{user_openid}",
@@ -301,6 +355,8 @@ class Summarizer:
                 store=self._store,
                 index=self._index,
                 scope=SCOPE_ALL,
+                instruction=instruction,
+                allow_publish=False,
             ),
         )
 
@@ -348,4 +404,10 @@ class Summarizer:
         return SummaryResult(
             text=extract_reply(messages) or NO_ANSWER,
             coverage=context.coverage,
+            # Carried out of the graph the same way `coverage` is — by reference
+            # on the injected context. Same caveat as `CoverageLog`: if LangGraph
+            # ever copies the context, these come back empty and every publish
+            # would look like a non-publish to the caller.
+            published_ids=list(context.published_ids),
+            published_text=context.published_text,
         )

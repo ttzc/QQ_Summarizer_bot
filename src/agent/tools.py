@@ -46,6 +46,7 @@ The asymmetry is deliberate, and it is not symmetric the other way round:
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -54,6 +55,7 @@ from typing import Any, Sequence
 
 from langchain.tools import ToolRuntime, tool
 
+from src.agent.publish import insert_document
 from src.config import config
 from src.logger import setup_logger
 from src.media.sniff import sniff_image
@@ -68,6 +70,12 @@ logger = setup_logger("qqbot.agent.tools")
 # all. When the cap bites we keep the *newest* messages (what "最近" usually
 # means) and tell the model how many were dropped so it can narrow the range.
 MAX_TOOL_CHARS = 12000
+
+# QQ renders an @ as `<@32-hex-openid>` inside the message text itself, and the
+# stored `instruction` keeps it byte-for-byte (like every other raw field here).
+# Used only to *render a short label* — see `_label_of`. Nothing that goes into
+# `content` / `raw_json` / a document body passes through it.
+_MENTION_RE = re.compile(r"<@!?[0-9A-Fa-f]*>")
 
 SCOPE_GROUP = "group"
 SCOPE_ALL = "all"
@@ -113,13 +121,31 @@ class CoverageLog:
         count: int,
         ts_start: str | None = None,
         ts_end: str | None = None,
+        *,
+        envelope: bool = True,
     ) -> None:
+        """Record one read.
+
+        `envelope=False` marks a read that **proves grounding but not coverage** —
+        looking at the corpus tells you the answer is not invented out of thin
+        air, yet it says nothing about having read the discussion a window spans.
+        Anything reading *the library itself* must pass it; see
+        `summaries_in_range` / `get_summary`.
+
+        Skipping it would be subtle and fatal: the envelope feeds
+        `summaries.ts_start/ts_end`, which is the axis the duplicate-guard query
+        overlaps on. So a run that checked the library before writing would
+        inherit the newest existing `ts_end` as its own, each new document would
+        claim to cover "up to now", every later overlap query would hit itself,
+        and the dedup rule would invert into "never publish anything".
+        """
         self.reads.append(
             {
                 "tool": tool_name,
                 "count": int(count),
                 "ts_start": ts_start,
                 "ts_end": ts_end,
+                "envelope": envelope,
             }
         )
 
@@ -128,10 +154,15 @@ class CoverageLog:
         self.add(tool_name, len(rows), start, end)
 
     def intervals(self) -> list[tuple[str, str]]:
+        """The coverage **envelope** — reads that actually span material.
+
+        Deliberately narrower than `is_empty()`: this feeds the stored time
+        window, so library-inspection reads are excluded (see `add`).
+        """
         return [
             (r["ts_start"], r["ts_end"])
             for r in self.reads
-            if r.get("ts_start") and r.get("ts_end")
+            if r.get("ts_start") and r.get("ts_end") and r.get("envelope", True)
         ]
 
     def message_count(self) -> int:
@@ -139,6 +170,12 @@ class CoverageLog:
         return sum(int(r.get("count") or 0) for r in self.reads)
 
     def is_empty(self) -> bool:
+        """Nothing at all was read — not even the library.
+
+        The "was this grounded in anything" test, and deliberately broader than
+        `intervals()`: a synthesis built purely from existing summaries has no
+        covered window of raw messages but is still not invented.
+        """
         return not self.reads
 
 
@@ -155,6 +192,28 @@ class BotContext:
     # per-invocation context, so the cap resets by construction every summary —
     # no registry, no TTL, nothing to leak.
     views_used: int = 0
+
+    # ---- provenance: what this run was, for the document it publishes ----
+    # The three fields the `save_summary` tool needs to write a complete row,
+    # injected rather than passed as tool arguments for the same reason
+    # `group_openid` is: the model must not be able to name a requester, pick a
+    # `trigger`, or claim credit for a turn it was not asked to publish.
+    instruction: str = ""
+    requested_by: str | None = None
+    trigger: str = "at"
+    # Off for the offline `ask` without `--save`: the publishing tool is bound at
+    # agent construction and cannot be removed per-call, so the gate lives here.
+    allow_publish: bool = True
+
+    # ---- per-run budgets and what got published ----------------------------
+    # Same reasoning as `views_used`: both caps are *per answer*, and the context
+    # object is created per answer, so this needs no bookkeeping to reset.
+    publishes_used: int = 0
+    doc_reads_used: int = 0
+    # Read back by the caller after `ainvoke`, riding out of the graph on the
+    # same by-reference context that `coverage` does (see `CoverageLog`).
+    published_ids: list[str] = field(default_factory=list)
+    published_text: str = ""
 
 
 def _render(
@@ -487,12 +546,215 @@ async def view_image(
     return f"[图片定向回答] {answer}"
 
 
+def _label_of(instruction: Any) -> str:
+    """The one-line "what is this document" for a listing.
+
+    Built from the stored `instruction` rather than a new column: that column is
+    NOT NULL, already carries the requester's own words ("总结一下今天"), and is
+    strictly better than a title the model invents at publish time — those come
+    out as "群聊总结" / "今日讨论", cost tokens to produce, and need a paragraph
+    of prompt to be any good. Adding a column for it would also be the only
+    schema change this feature needs.
+
+    Mention markup is stripped **here only**. Real `instruction` values start with
+    QQ's own `<@32-hex-openid>` token (真机 2026-10-09 库里的行就是这样), which would
+    spend the whole 40-char budget on an openid the reader cannot use — the group
+    is already implicit in "this listing is for my group". The column itself stays
+    byte-for-byte, as everywhere else in this project.
+    """
+    text = _MENTION_RE.sub(" ", str(instruction or ""))
+    text = " ".join(text.split())
+    if not text:
+        return "（无指令）"
+    return text[:40] + "…" if len(text) > 40 else text
+
+
+@tool
+async def summaries_in_range(
+    start_iso: str,
+    end_iso: str,
+    limit: int = 20,
+    *,
+    runtime: ToolRuntime[BotContext, dict],
+) -> str:
+    """看**库里**哪些总结的覆盖时段与给定范围相交。仅群内场景。
+
+    投稿前的自查工具：刚用 messages_in_range 读完 `[start, end]` 的原文，就用
+    **同一段时间**问这里——空返回说明这段还没被写过，有返回说明已经有人写过，
+    除非你能补充新东西，否则不要再投一篇。
+
+    时间参数是 ISO8601（如 "2026-07-21T00:00:00+08:00"），与 messages_in_range
+    同一套。返回只有清单（短 id、原指令摘要、覆盖时段、条数），**不含正文**；
+    需要比对内容再用 get_summary 读那一篇。
+    """
+    ctx: BotContext = runtime.context
+    if not ctx.group_openid:
+        return "（本场景没有群上下文，无法查本群的总结清单）"
+    try:
+        start = datetime.fromisoformat(start_iso)
+        end = datetime.fromisoformat(end_iso)
+    except (TypeError, ValueError):
+        return (
+            f"时间格式无法解析：start_iso={start_iso!r} end_iso={end_iso!r}。"
+            "请使用 ISO8601，例如 2026-07-21T00:00:00+08:00。"
+        )
+    if start > end:
+        start, end = end, start
+
+    cap = max(1, min(int(limit), 100))
+    rows, total = ctx.store.summaries_in_range(
+        ctx.group_openid, start.isoformat(), end.isoformat(), cap
+    )
+    if total == 0:
+        return "这段时间库里还没有任何总结。"
+    # Listing the library is grounding, but it proves nothing about having read
+    # the discussion, so it must not enter the coverage envelope — see `add`.
+    ctx.coverage.add("summaries_in_range", 0, envelope=False)
+    lines = [
+        f"{row['summary_id'][:8]}｜{_label_of(row['instruction'])}｜"
+        f"{_stamp(row['ts_start'])}~{_stamp(row['ts_end'])}｜"
+        f"{int(row['message_count'] or 0)} 条｜{'自动' if row['trigger'] == 'auto' else '被@'}"
+        for row in rows
+    ]
+    if total > len(rows):
+        lines.append(
+            f"……（该时段共 {total} 篇，此处只列覆盖时段最近的 {len(rows)} 篇；"
+            "如需更早的，请把范围缩小到具体某天再查）"
+        )
+    return "\n".join(lines)
+
+
+@tool
+async def get_summary(
+    summary_ref: str,
+    *,
+    runtime: ToolRuntime[BotContext, dict],
+) -> str:
+    """按短 id 读**一篇**已入库总结的正文。仅群内场景。
+
+    summary_ref 是 summaries_in_range 每行开头的那个短 id（至少 6 位）。
+    只有在你确实需要比对旧稿的措辞或结论时才调——正文很长，读一篇占一轮。
+    """
+    ctx: BotContext = runtime.context
+    # Refuse outright rather than read "no group" as "every group": this tool is
+    # only in the group set, so an empty scope here means a wiring mistake, and
+    # the fail-open version of it would be a cross-group read.
+    if not ctx.group_openid:
+        return "（本场景没有群上下文，无法读本群总结）"
+    row = ctx.store.find_summary(summary_ref)
+    if row is None:
+        return (
+            f"找不到这篇总结：{summary_ref!r}。请用 summaries_in_range 返回的"
+            "行首短 id（至少 6 位）。"
+        )
+    # Same reasoning as `view_image`: the short id is guessable, so the group
+    # scope refuses rather than trusting luck.
+    if row["group_openid"] != ctx.group_openid:
+        return "无权查看其他群的总结。"
+    if ctx.doc_reads_used >= int(config.summary.max_doc_reads):
+        return (
+            f"本次回答读取已有总结已达上限（{config.summary.max_doc_reads} 篇），"
+            "请基于已有信息作答。"
+        )
+    ctx.doc_reads_used += 1
+    body = str(row["content"] or "").strip()
+    # Reading a document is grounding, not coverage: it must stay out of the
+    # envelope the published row will carry.
+    ctx.coverage.add("get_summary", 0, envelope=False)
+    if len(body) > MAX_TOOL_CHARS:
+        body = body[:MAX_TOOL_CHARS] + "\n……（正文过长，此处已截断）"
+    return (
+        f"[已入库总结｜{_label_of(row['instruction'])}｜"
+        f"{_stamp(row['ts_start'])}~{_stamp(row['ts_end'])}｜"
+        f"{int(row['message_count'] or 0)} 条]\n{body}"
+    )
+
+
+@tool
+async def save_summary(
+    content: str,
+    *,
+    runtime: ToolRuntime[BotContext, dict],
+) -> str:
+    """把一份**值得长期留存**的总结写入知识库（本群的文档库）。
+
+    只在这一轮的产出确实是一篇文档时调用：用户要的是「这段时间聊了什么」这类
+    可独立阅读的总结，或你对已有总结做了真正新增的综合。**只是回答一个事实问题
+    （谁说过 X / 有没有提过 Y / 某个细节是什么）时不要调用**，直接回答即可。
+
+    判据由你掌握，但写之前应当先查过 summaries_in_range——同一段时间已经有稿子
+    就别再投一篇，除非你确实梳理出了新东西。`content` 是要入库的**完整正文**
+    （按话题组织、标注发言人与时间、结尾说明覆盖范围）；调用成功后，回群里只需
+    给出要点与覆盖范围，**不要把正文再抄一遍**。
+    """
+    ctx: BotContext = runtime.context
+    if not ctx.group_openid:
+        return "（本场景没有群上下文，无法入库）"
+    if not ctx.allow_publish:
+        return "这个场景不允许写入知识库，请直接回答。"
+
+    text = (content or "").strip()
+    floor = int(config.summary.min_publish_chars)
+    if len(text) < floor:
+        return (
+            f"未入库：正文只有 {len(text)} 字，低于一篇文档的下限（{floor} 字）。"
+            "如果用户只是问了个问题，请直接回答，不要投稿。"
+        )
+    if ctx.coverage.is_empty():
+        return (
+            "未入库：这一轮没有读过任何消息或已有总结，不能凭会话记忆立档。"
+            "要投稿请先用 recent_messages / messages_in_range / search_summaries 取数。"
+        )
+    budget = int(config.summary.max_publish_per_run)
+    if ctx.publishes_used >= budget:
+        return (
+            f"未入库：本次回答已投稿 {ctx.publishes_used} 篇，达到上限（{budget} 篇）。"
+            "请把内容合并成一篇，或直接基于已有信息作答。"
+        )
+
+    try:
+        summary_id = insert_document(
+            ctx.store,
+            group_openid=ctx.group_openid,
+            instruction=ctx.instruction,
+            content=text,
+            coverage=ctx.coverage.intervals(),
+            message_count=ctx.coverage.message_count(),
+            requested_by=ctx.requested_by,
+            trigger=ctx.trigger,
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed write must not kill the turn
+        logger.warning(
+            "save_summary 入库失败",
+            extra={"group": ctx.group_openid, "err": repr(exc)[:200]},
+        )
+        return f"入库失败：{repr(exc)[:120]}。请直接把你的结论回答给群里。"
+
+    ctx.publishes_used += 1
+    ctx.published_ids.append(summary_id)
+    ctx.published_text = text
+    logger.info(
+        "总结已由 agent 投稿入库",
+        extra={
+            "group": ctx.group_openid,
+            "trigger": ctx.trigger,
+            "summary_id": summary_id,
+            "chars": len(text),
+            "messages": ctx.coverage.message_count(),
+        },
+    )
+    return f"已入库（{summary_id[:8]}），覆盖 {ctx.coverage.message_count()} 条消息。"
+
+
 GROUP_TOOLS = [
     current_time,
     recent_messages,
     messages_in_range,
     search_summaries,
     view_image,
+    summaries_in_range,
+    get_summary,
+    save_summary,
 ]
 C2C_TOOLS = [
     current_time,
@@ -502,17 +764,23 @@ C2C_TOOLS = [
     view_image,
 ]
 
-# Tools that actually read stored data, as opposed to `current_time`, which only
-# tells the agent what time it is. Used by `Summarizer` to decide whether an
-# answer is grounded in anything — see `SummaryResult.storable`.
-# `view_image` is deliberately NOT in here: it reads a picture, not messages, so
-# it must not inflate the coverage bookkeeping nor make an image-only answer
-# "storable" on its own.
+# Tools that put material into the coverage log — as opposed to `current_time`
+# (which only says what time it is) and `view_image` (which reads a picture, not
+# messages). Used by `Summarizer` to warn when a run called a data tool yet
+# recorded no window.
+#
+# `summaries_in_range` / `get_summary` **are** listed: they genuinely read stored
+# data, and a run that consulted the library must not trip that warning. Their
+# entries carry `envelope=False`, so they widen "was this grounded" without
+# touching the time window — which is the whole point of the split in `add`.
+# `save_summary` is a writer, not a reader, so it is not here.
 DATA_TOOLS = frozenset(
     {
         "recent_messages",
         "messages_in_range",
         "search_summaries",
         "messages_across_groups",
+        "summaries_in_range",
+        "get_summary",
     }
 )

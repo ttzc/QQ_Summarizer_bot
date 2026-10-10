@@ -45,10 +45,21 @@ FALLBACK_REPLY = "抱歉，处理这条指令时出错了，请稍后再试。"
 
 
 class SummarizerLike(Protocol):
-    """What the client needs from the agent layer (`src/agent/summarizer.py`)."""
+    """What the client needs from the agent layer (`src/agent/summarizer.py`).
+
+    `summarize_group`'s extra keywords are keyword-only in the protocol so a fake
+    that ignores them (`**kw`) still satisfies it — the client is the only caller
+    that supplies them, and they are provenance for the publishing tool.
+    """
 
     async def summarize_group(
-        self, group_openid: str, instruction: str
+        self,
+        group_openid: str,
+        instruction: str,
+        *,
+        requested_by: str | None = ...,
+        trigger: str = ...,
+        allow_publish: bool = ...,
     ) -> SummaryResult: ...
 
     async def answer_private(
@@ -247,6 +258,10 @@ class SummarizerClient(botpy.Client):
     ) -> str | None:
         """Persist a summary and wake the indexer. Never raises.
 
+        The **fallback** write, reached only when the run published nothing
+        itself: the auto path with a model that did not call `save_summary`, and
+        nothing else (the `@` path never stores here any more — see `_respond`).
+
         Returns the new `summary_id`, or `None` when the answer was not a
         document — which the auto-summary path also reads as "nothing worth
         pushing to the group".
@@ -283,6 +298,40 @@ class SummarizerClient(botpy.Client):
             },
         )
         return summary_id
+
+    def _note_publish(self, group_openid: str, result: SummaryResult) -> None:
+        """Account for documents the agent wrote *during* its own run.
+
+        The rows already exist — `save_summary` inserted them mid-run — so what is
+        left for the bot is the one thing only it can do: wake the indexer. Waking
+        stays the bot's job rather than the tool's because the callback is the
+        bot's to hand over, and one wake per run (rather than one per published
+        document) is what the indexer's `batch` loop wants anyway.
+
+        The `elif` is the instrument for watching where the model put its
+        publishing bar: `qqbot stats` says how big the corpus is, this line says
+        why a particular @ — one that *did* read messages — contributed nothing.
+        """
+        if result.published:
+            if self._wake_indexer is not None:
+                self._wake_indexer()
+            logger.info(
+                "agent 投稿入库",
+                extra={
+                    "group": group_openid,
+                    "docs": len(result.published_ids),
+                    "chars": len(result.published_text),
+                    "messages": result.coverage.message_count(),
+                },
+            )
+        elif not result.coverage.is_empty():
+            # It read something, answered, and declined to publish. Normal for a
+            # question; the line exists so "the corpus stopped growing" is a log
+            # query away rather than a mystery.
+            logger.info(
+                "答复判定为问答，未入库",
+                extra={"group": group_openid, "chars": len(result.text)},
+            )
 
     # ---- auto-summary -----------------------------------------------------
 
@@ -334,27 +383,40 @@ class SummarizerClient(botpy.Client):
         cfg = config.auto_summary
         try:
             result = await self._summarizer.summarize_group(
-                group_openid, cfg.instruction
+                group_openid, cfg.instruction, trigger="auto"
             )
         except Exception:  # noqa: BLE001 - must not kill the event task
             logger.exception("自动总结失败", extra={"group": group_openid})
             return
 
-        # Stored first, and regardless of `notify`: whether the group gets a copy
-        # does not change whether the answer is a document, and a failed send
-        # would otherwise lose it for good.
-        summary_id = self._store_summary(
-            group_openid=group_openid,
-            instruction=cfg.instruction,
-            requested_by=None,
-            result=result,
-            trigger="auto",
-        )
+        # The auto path stores **whatever happens**, which is why it does not go
+        # through the publishing tool the `@` path uses: its own gate is the
+        # message count, and a model that declined to publish would otherwise
+        # burn a 30-minute cooldown and leave the count unreset — re-running the
+        # same batch forever. `store_summary` short-circuits on `result.published`
+        # so a model that *did* publish cannot produce a second row for one run.
+        if result.published:
+            self._note_publish(group_openid, result)
+            summary_id = result.published_ids[-1]
+        else:
+            summary_id = self._store_summary(
+                group_openid=group_openid,
+                instruction=cfg.instruction,
+                requested_by=None,
+                result=result,
+                trigger="auto",
+            )
+
         if summary_id is None or not cfg.notify:
-            # Either it was not a document (nothing worth pushing) or the group
+            # Either nothing was a document (nothing worth pushing) or the group
             # was not asked for a copy. Both end here.
             return
 
+        # Push the **document**, not the model's closing remark: nobody in the
+        # group is waiting on a reply here, and a bare "已收录，覆盖…" would be a
+        # notification about a file rather than the thing itself. Under the `@`
+        # path that short remark is correct precisely because a human is waiting.
+        body = result.published_text or result.text
         # `msg_id=None` makes this an *active* message: it consumes quota (20/min
         # per group) and needs the owner to have enabled bot-initiated pushes.
         # The prefix marks it as unprompted in the chat — the stored document is
@@ -363,7 +425,7 @@ class SummarizerClient(botpy.Client):
             self.api,
             group_openid,
             None,
-            f"〔自动总结〕\n{result.text}",
+            f"〔自动总结〕\n{body}",
         )
 
     async def _respond(self, record: GroupMessageRecord) -> None:
@@ -371,7 +433,10 @@ class SummarizerClient(botpy.Client):
         instruction = record.body()
         try:
             result = await self._summarizer.summarize_group(
-                record.group_openid, instruction
+                record.group_openid,
+                instruction,
+                requested_by=record.author_openid,
+                trigger="at",
             )
             text = result.text
         except Exception:  # noqa: BLE001 - answer the group even when the agent dies
@@ -380,16 +445,12 @@ class SummarizerClient(botpy.Client):
             result = None
 
         if result is not None:
-            # Stored before the send, and independently of it: whether the group
-            # received the reply does not change whether the answer is a document,
-            # and a 429 or a `None` return would otherwise lose it for good.
-            self._store_summary(
-                group_openid=record.group_openid,
-                instruction=instruction,
-                requested_by=record.author_openid,
-                result=result,
-                trigger="at",  # someone summoned the bot; see `_auto_summarize`
-            )
+            # No unconditional store any more. Whether this answer is a document
+            # is the agent's decision — it publishes mid-run through
+            # `save_summary`, which is *earlier* than the old "store after the
+            # run" ordering, so a send failure still cannot lose a document.
+            # All that is left here is accounting for what it wrote.
+            self._note_publish(record.group_openid, result)
 
         # A summary can take a while; `reply_chunked` downgrades to an active
         # message if the 5-minute passive window has run out.

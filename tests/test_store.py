@@ -112,6 +112,180 @@ def test_summaries_insert_coverage_and_marks(store) -> None:
     assert one["trigger"] == "at", "被 @ 触发的总结记为 at"
 
 
+def test_summaries_in_range_overlaps_the_covered_window(store) -> None:
+    """`summaries_in_range` answers "has this stretch been written up".
+
+    The axis is the document's **covered window** (`ts_start`/`ts_end`), never
+    `created_at`, and every row here is created *now* while covering July — which
+    is exactly the shape that makes the two axes differ. A "newest N by
+    created_at" listing would show all three for an October question.
+    """
+    # 一篇「今天写的、覆盖上周三」的稿子：这就是 @ 投稿带来的新形状。
+    store.insert_summary(
+        group_openid="G_demo",
+        instruction="总结上周三那场争论",
+        content="上周三的争论。",
+        coverage=[("2026-07-15T10:00:00+08:00", "2026-07-15T11:00:00+08:00")],
+        message_count=9,
+    )
+    store.insert_summary(
+        group_openid="G_demo",
+        instruction="总结今天的排期",
+        content="今天的排期。",
+        coverage=[("2026-07-21T08:00:00+08:00", "2026-07-21T10:00:00+08:00")],
+        message_count=12,
+    )
+    store.insert_summary(
+        group_openid="G_other",
+        instruction="别群的总结",
+        content="别群内容。",
+        coverage=[("2026-07-21T08:30:00+08:00", "2026-07-21T09:00:00+08:00")],
+        message_count=4,
+    )
+    # 无覆盖时段（读库做的综合稿会这样）：不可能与任何区间重叠，接受其不可见。
+    store.insert_summary(
+        group_openid="G_demo", instruction="综合稿", content="没有时段。",
+        coverage=[], message_count=0,
+    )
+
+    def q(gid, start, end, limit=20):
+        return store.summaries_in_range(gid, start, end, limit)
+
+    rows, total = q("G_demo", "2026-07-21T09:00:00+08:00", "2026-07-21T09:30:00+08:00")
+    assert total == 1 and len(rows) == 1, "落在窗口内部才算命中"
+    assert rows[0]["instruction"] == "总结今天的排期", "命中的是覆盖该时段的那篇"
+
+    rows, total = q("G_demo", "2026-10-10T00:00:00+08:00", "2026-10-10T23:00:00+08:00")
+    assert total == 0 and rows == [], "全部稿子都是刚才创建的，但没有一篇覆盖十月"
+
+    rows, total = q("G_demo", "2026-07-15T10:30:00+08:00", "2026-07-15T10:40:00+08:00")
+    assert total == 1 and rows[0]["instruction"] == "总结上周三那场争论", (
+        "按覆盖时段查得到「今天生成、覆盖上周」的旧稿（created_at 序会把它排到最前，"
+        "查最近 N 篇的方式恰好会漏掉这种）"
+    )
+
+    rows, total = q("G_demo", "2026-07-21T10:00:00+08:00", "2026-07-21T12:00:00+08:00")
+    assert total == 1, "端点相接算重叠（<= / >= 含两端）"
+    assert rows[0]["instruction"] == "总结今天的排期"
+
+    _, cross = q("G_other", "2026-07-21T08:30:00+08:00", "2026-07-21T08:40:00+08:00")
+    assert cross == 1, "换个群只看到那个群的稿子"
+    demo_rows, demo_total = q("G_demo", "2026-07-21T08:30:00+08:00", "2026-07-21T08:40:00+08:00")
+    assert demo_total == 1 and all(r["group_openid"] == "G_demo" for r in demo_rows), (
+        "群过滤不可省：别群同小时的稿子不能出现在本群清单里"
+    )
+
+    # `total` is the *pre-truncation* count — the caller renders it into a footer,
+    # and a short list that reads as a complete list is how duplicates get in.
+    for n in range(3):
+        store.insert_summary(
+            group_openid="G_demo",
+            instruction=f"第 {n} 次",
+            content=f"内容 {n}",
+            # Three documents whose windows all sit inside the queried range.
+            coverage=[(f"2026-07-22T0{n}:00:00+08:00", f"2026-07-22T0{n}:30:00+08:00")],
+            message_count=n,
+        )
+    page, total = q("G_demo", "2026-07-22T00:00:00+08:00", "2026-07-22T03:00:00+08:00", limit=2)
+    assert total == 3 and len(page) == 2, "返回页数少于命中数时，total 仍是真实总数"
+    assert str(page[0]["ts_end"]).startswith("2026-07-22T02"), "截断保留覆盖时段最近的"
+    assert {str(r["instruction"]) for r in page} == {"第 2 次", "第 1 次"}, "最近的 N 篇，不是前 N 篇"
+
+    # Offsets must be normalised, not compared as text (§4.2).
+    z_rows, z_total = q("G_demo", "2026-07-21T01:00:00Z", "2026-07-21T01:30:00Z")
+    assert z_total == 1, "带 Z 的边界能正确比对（+08:00 与 Z 混用）"
+    assert z_rows[0]["instruction"] == "总结今天的排期", "09:00+08:00 == 01:00Z"
+
+
+def test_find_summary_prefix_and_scope(store) -> None:
+    sid = store.insert_summary(
+        group_openid="G_demo",
+        instruction="总结一下",
+        content="正文",
+        coverage=[("2026-07-21T08:00:00+08:00", "2026-07-21T10:00:00+08:00")],
+        message_count=1,
+    )
+    assert store.find_summary(sid)["content"] == "正文", "整 id 能查到"
+    assert store.find_summary(sid[:8])["summary_id"] == sid, "8 位短 id 前缀命中"
+    assert store.find_summary(f"#{sid[:6]}")["summary_id"] == sid, "去 # 前缀、6 位起判"
+    assert store.find_summary(sid[:4]) is None, "太短的前缀直接拒（撞库护栏）"
+    assert store.find_summary("zzzzzz") is None, "非十六进制返回 None 而不是抛"
+    assert store.find_summary("") is None, "空串返回 None"
+    # The scope check is the *caller's* job (`view_image` does the same), so the
+    # store stays group-agnostic and returns the row for it to refuse.
+    assert store.find_summary(sid)["group_openid"] == "G_demo", "行里带着归属可供校验"
+
+
+def test_schema_and_migrations_agree(tmp_path) -> None:
+    """`schema.sql` and `_MIGRATIONS` must describe the same table.
+
+    The comment above `_MIGRATIONS` states the rule (`CREATE TABLE IF NOT EXISTS`
+    adds a *table* to an existing database but never a *column*), and breaking it
+    is invisible in tests: a fresh DB gets the column from the DDL and works,
+    while the real `data/qqbot.db` — created before that column existed — then
+    fails on the first write. So assert the two lists agree instead of trusting
+    either one.
+    """
+    import re
+    from pathlib import Path
+
+    from src.store.sql_store import _MIGRATIONS
+
+    ddl = Path("src/store/sql/schema.sql").read_text(encoding="utf-8")
+    for table, column, _ddl in _MIGRATIONS:
+        block = re.search(
+            rf"CREATE TABLE IF NOT EXISTS {table} \((.*?)\n\);", ddl, re.S
+        )
+        assert block, f"schema.sql 里没有 {table} 的建表语句"
+        names = {
+            line.strip().split()[0]
+            for line in block.group(1).splitlines()
+            if line.strip() and not line.strip().startswith(("--", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"))
+        }
+        assert column in names, (
+            f"{table}.{column} 在 _MIGRATIONS 里，但 schema.sql 的 DDL 没有它——"
+            "新库会缺这一列（老库靠 ALTER 才有）"
+        )
+
+    # The事故 this guards is asymmetric, so open a database that predates a
+    # post-release column and check `_migrate()` repairs it without touching rows.
+    import sqlite3
+
+    from src.store.sql_store import SQLStore
+
+    old_db = tmp_path / "old.db"
+    conn = sqlite3.connect(old_db)
+    conn.execute(
+        """
+        CREATE TABLE summaries (
+            summary_id TEXT PRIMARY KEY, group_openid TEXT NOT NULL,
+            instruction TEXT NOT NULL, content TEXT NOT NULL,
+            coverage_json TEXT, ts_start TEXT, ts_end TEXT,
+            message_count INTEGER NOT NULL DEFAULT 0, requested_by TEXT,
+            created_at TEXT NOT NULL, indexed_at TEXT
+        )
+        """
+    )  # 没有 `trigger`：发布第一版时的形状
+    conn.execute(
+        "INSERT INTO summaries VALUES ('a'*32, 'G_demo', '总结一下', '旧稿', NULL, "
+        "NULL, NULL, 0, NULL, '2026-07-21 10:00:00', NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    migrated = SQLStore(old_db)
+    try:
+        cols = {r[1] for r in migrated._conn.execute("PRAGMA table_info(summaries)")}
+        assert "trigger" in cols, "缺的列被 ALTER 补回来了"
+        assert [str(r["content"]) for r in migrated.summaries_for("G_demo")] == ["旧稿"], (
+            "迁移不改写任何既有行"
+        )
+        # 再开一次：`_migrate()` 靠 PRAGMA 判重，不该第二次 ALTER。
+        SQLStore(old_db).close()
+    finally:
+        migrated.close()
+
+
 def test_messages_since_last_summary(store) -> None:
     """自动总结的计数：定义在「距上次总结之后」，按群隔离。"""
     for i in range(3):

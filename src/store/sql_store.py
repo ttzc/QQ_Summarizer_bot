@@ -571,6 +571,66 @@ class SQLStore:
             )
         return cursor.fetchall()
 
+    def summaries_in_range(
+        self, group_openid: str, start_iso: str, end_iso: str, limit: int = 20
+    ) -> tuple[list[sqlite3.Row], int]:
+        """Summaries whose **covered window overlaps** `[start, end]`.
+
+        Returns `(page, total)` — `total` is how many rows matched before the
+        `limit` cut, so the caller can tell the model it is looking at a
+        truncated list rather than the whole picture. An honest footer is not a
+        nicety here: a model that reads "these are the summaries" when it is
+        really "the newest 20 of 47" will conclude the window is covered and
+        stop writing anything about the older part.
+
+        Overlap, not creation order, is the axis this needs. The question a
+        writer asks is "has **this stretch of conversation** already been
+        written up", and `created_at` answers a different question — a document
+        made today that covers last Wednesday sorts first under `created_at` and
+        is exactly the row the dedup check must see for a "last Wednesday" ask.
+
+        `group_openid` is required (no `None` form) because every caller is the
+        in-group path: a cross-group listing would hand group A the shape of
+        group B's discussion even without the text.
+
+        Bounds compare through `datetime()`, never as text — the same reason
+        `messages_in_range` does: timestamps arrive with differing UTC offsets,
+        and ISO strings only sort correctly when they all agree on one. Rows
+        with a NULL bound cannot overlap, so they stay out; that is accepted
+        rather than special-cased.
+        """
+        where = """
+            FROM summaries
+            WHERE group_openid = ?
+              AND datetime(ts_start) <= datetime(?)
+              AND datetime(ts_end)   >= datetime(?)
+        """
+        total = self._conn.execute(f"SELECT COUNT(*) {where}", (group_openid, end_iso, start_iso)).fetchone()[0]
+        cursor = self._conn.execute(
+            f"SELECT * {where} ORDER BY datetime(ts_end) DESC, rowid DESC LIMIT ?",
+            (group_openid, end_iso, start_iso, max(1, int(limit))),
+        )
+        return cursor.fetchall(), int(total)
+
+    def find_summary(self, ref: str) -> sqlite3.Row | None:
+        """Find one summary by (short) id — prefix match, newest first.
+
+        Shaped like `find_media`: the ≥6-hex rule is an *accuracy* guard against
+        collisions, not the security check. The privacy check is the caller
+        comparing `row["group_openid"]` against its own scope.
+        """
+        ref = (ref or "").strip().lstrip("#").strip().lower()
+        if len(ref) < 6 or not all(c in "0123456789abcdef" for c in ref):
+            return None
+        cursor = self._conn.execute(
+            """
+            SELECT * FROM summaries WHERE summary_id LIKE ? || '%'
+            ORDER BY datetime(created_at) DESC, rowid DESC LIMIT 1
+            """,
+            (ref,),
+        )
+        return cursor.fetchone()
+
     def groups_with_messages(self) -> list[str]:
         """Every group the bot has received messages from.
 

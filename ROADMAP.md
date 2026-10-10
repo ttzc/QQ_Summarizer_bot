@@ -41,11 +41,11 @@
 
 现状：图片只渲染成 `[图片 <十六进制串>.jpg]`，信息量≈0（CLAUDE.md §5.1）。库里已经有 `url`，只是没人读。
 
-方案骨架：**落盘解决时效，按需看图解决语义**（定稿细节全部在 MEDIA.md）——**2026-10-10 脱机实现完成**，套件 51 项全绿。
+方案骨架：**落盘解决时效，按需看图解决语义**（定稿细节全部在 MEDIA.md）——**2026-10-10 脱机实现完成**，套件 51 项全绿（本次投稿改造后为 72 项）。
 
 - [x] `data/media/YYYY-MM-DD/<sha256>.<ext>` 本地存图（`src/media/worker.py`）：按**消息发送日期**分桶，内容哈希全局去重（已登记即复用旧 path；tmp+rename 原子写盘）。URL 时效就此降级：队列分钟级排空 ≪ 实测 17 分钟有效期。
 - [x] `media` 表（DATA_MODEL §2.7；一行 = 一次附件出现，uuid 主键 + 哈希列文件去重；pending → stored 终态，失败分态 expired / skipped / failed）+ `MediaWorker` 只落盘、零 LLM；`insert_messages` 同事务插行去重免费；占位嵌 8 位短 id：`[图片 xx.jpg #a1b2c3d4]`。
-- [x] **`view_image(media_ref, focus?)`** 进群与私聊两个工具集（各 5 个）：一次性视觉调用（不进主循环/checkpointer），通用描述缓存回写 `description`+`content`（`save_media_description` 的 `description IS NULL` 守卫 = 幂等锁），focus 不落缓存；群归属行级校验 + `max_views` 限流 + 失败返回错误文本。`src/media/vision.py`，不进 `DATA_TOOLS`。
+- [x] **`view_image(media_ref, focus?)`** 进群与私聊两个工具集（改造后群 8 个 / 私聊 5 个）：一次性视觉调用（不进主循环/checkpointer），通用描述缓存回写 `description`+`content`（`save_media_description` 的 `description IS NULL` 守卫 = 幂等锁），focus 不落缓存；群归属行级校验 + `max_views` 限流 + 失败返回错误文本。`src/media/vision.py`，不进 `DATA_TOOLS`。
 - [x] 图片**不预生成描述**（安静的讨论零成本）；魔数白名单 `src/media/sniff.py`；`qqbot media` 只读排查 + `stats` 图片三格；带图消息才拨 `wake_media`。
 - [x] 脱机验收 = `tests/test_media.py` 12 项（假下载器 + 假视觉、真 SQLite + 真写盘），`test_agent.py` 工具集断言已同步 4→5。
 - [ ] 真机：第一条真实图片 pending→stored；一次 @ 总结中模型主动 `view_image` 的全链路；隔天重放验证离线积压场景（决定 expired 要不要配人工重放）。

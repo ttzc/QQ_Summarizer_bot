@@ -30,11 +30,14 @@ from src.agent.tools import (
     SCOPE_GROUP,
     BotContext,
     CoverageLog,
+    get_summary,
     list_groups,
     messages_across_groups,
     messages_in_range,
     recent_messages,
+    save_summary,
     search_summaries,
+    summaries_in_range,
 )
 from src.bot.events import GroupMessageRecord
 from src.config import config
@@ -117,11 +120,17 @@ def _seeded(store, tmp_path):
 
 
 class _RT:
-    """Stand-in runtime for calling tool coroutines directly (bypasses ToolNode)."""
+    """Stand-in runtime for calling tool coroutines directly (bypasses ToolNode).
 
-    def __init__(self, gid, scope=SCOPE_GROUP, *, store=None, index=None):
+    Extra keyword arguments land on the `BotContext`, which is how a test supplies
+    the provenance the publishing tool reads (`instruction`, `requested_by`,
+    `trigger`, `allow_publish`) — those are injected fields, never tool args, so
+    there is no other way to set them.
+    """
+
+    def __init__(self, gid, scope=SCOPE_GROUP, *, store=None, index=None, **ctx_kw):
         self.context = BotContext(
-            group_openid=gid, store=store, index=index, scope=scope
+            group_openid=gid, store=store, index=index, scope=scope, **ctx_kw
         )
 
 
@@ -167,24 +176,32 @@ def test_tool_sets_and_privacy_direction() -> None:
     c2c_by_name = {t.name: t for t in C2C_TOOLS}
     assert set(group_by_name) == {
         "current_time", "recent_messages", "messages_in_range", "search_summaries",
-        "view_image",
-    }, "群内工具集是那 5 个"
+        "view_image", "summaries_in_range", "get_summary", "save_summary",
+    }, "群内工具集是那 8 个"
     assert set(c2c_by_name) == {
         "current_time", "search_summaries", "list_groups", "messages_across_groups",
         "view_image",
-    }, "私聊工具集是那 5 个"
+    }, "私聊工具集是那 5 个（投稿与库内自查都不给私聊：答复横跨多群，没有归属地）"
     # The two sets exist precisely because these two lines must both hold.
     assert "list_groups" not in group_by_name, "群内工具集没有跨群能力"
     assert "messages_across_groups" not in group_by_name, "群内工具集读不到别群的原文"
     assert (
         "recent_messages" not in c2c_by_name and "messages_in_range" not in c2c_by_name
     ), "私聊工具集没有按群读本群原文的工具"
+    # 私聊既不投稿，也不查本群的库（那两个工具都是按群过滤的）。
+    assert not (
+        {"save_summary", "summaries_in_range", "get_summary"} & set(c2c_by_name)
+    ), "写入知识库的能力只在群内工具集里"
     # `DATA_TOOLS` drives the "tools ran but coverage is empty" warning in
     # `Summarizer._run`; a data-reading tool missing from it makes that warning
-    # fire on every honest answer.
+    # fire on every honest answer. The two library-inspection tools belong here
+    # (they do read stored data) even though their entries carry `envelope=False`
+    # and so cannot widen a document's time window — see `test_envelope_excludes_library_reads`.
     assert {
-        "recent_messages", "messages_in_range", "search_summaries", "messages_across_groups"
+        "recent_messages", "messages_in_range", "search_summaries",
+        "messages_across_groups", "summaries_in_range", "get_summary",
     } == set(DATA_TOOLS), "所有取数工具都登记在 DATA_TOOLS 里"
+    assert "save_summary" not in DATA_TOOLS, "写入工具不算取数工具"
     assert "current_time" not in DATA_TOOLS, "current_time 不算取数工具"
     # view_image 读的是图不是消息：不该进 coverage 记账，也不该让"只看了一张图"
     # 的回答自动构成文档。
@@ -370,6 +387,329 @@ async def test_messages_across_groups(store, tmp_path, monkeypatch) -> None:
     assert not visible["group"].is_required(), "group/keyword/limit 都可选"
 
 
+# ---- publishing: the agent decides what becomes a document -------------------
+
+
+def _hh(stamp) -> str:
+    """`HH:MM` out of a stored ISO timestamp, for assertions that read as times."""
+    from datetime import datetime as _dt
+
+    try:
+        return _dt.fromisoformat(str(stamp)).strftime("%H:%M")
+    except (TypeError, ValueError):
+        return f"??{stamp}"
+
+
+# Comfortably over `config.summary.min_publish_chars` — a document-shaped body,
+# not the one-line answer the floor is meant to reject.
+LONG_DOC = (
+    "## 上线安排\n"
+    "08:00 小明提出原定周四的上线要推迟，理由是回归测试还没跑完，环境也在等运维；"
+    "08:12 小红确认会议材料已经准备好，并建议改到周五下午三点，说这样测试能多出一晚。\n"
+    "09:00 小刚补充说会议室已经订好，前提是测试环境能在今晚之前恢复，否则要另找时间；"
+    "09:20 小明回复运维承诺二十四小时内处理，会先发一条确认。\n"
+    "## 材料分工\n"
+    "小红负责会议材料与演示脚本，小刚负责会议室与设备调试，小明跟进运维进度并在"
+    "群里同步结论。\n"
+    "## 结论\n"
+    "上线改期到周五下午三点，当前卡点是测试环境恢复，由小明跟进运维，最迟明早给出"
+    "确认；若环境未按时恢复，则顺延到下周一，由小红重新订会议室。\n"
+    "（覆盖本群 2026-07-21 08:00~09:20 的讨论，共 2 条消息。）"
+)
+
+
+async def test_save_summary_writes_the_submitted_body(store, tmp_path) -> None:
+    index = _seeded(store, tmp_path)
+    rt = _RT(
+        "G_demo",
+        store=store,
+        index=index,
+        instruction="总结一下今天",
+        requested_by="M_ming",
+        trigger="at",
+    )
+    # Ground the run the way a real one would be grounded, then publish.
+    await recent_messages.coroutine(limit=10, runtime=rt)
+    out = await save_summary.coroutine(content=LONG_DOC, runtime=rt)
+
+    assert "已入库" in out, f"投稿应被接受：{out}"
+    stored = store.summaries_for("G_demo")
+    mine = [r for r in stored if r["content"] == LONG_DOC.strip()]
+    assert len(mine) == 1, "正文原样入库（不是模型最后那句话）"
+    row = mine[0]
+    assert row["trigger"] == "at" and row["requested_by"] == "M_ming", (
+        "provenance 取自注入的 context"
+    )
+    assert row["instruction"] == "总结一下今天", "原始指令被保留"
+    assert row["message_count"] == 2, "消息条数来自本轮真实取数"
+    assert rt.context.published_ids and rt.context.published_text == LONG_DOC.strip(), (
+        "投稿结果带得出去，供调用方唤醒索引器与决定推送哪一篇"
+    )
+
+
+async def test_save_summary_refusals_are_visible_and_write_nothing(
+    store, tmp_path, monkeypatch
+) -> None:
+    """Every refusal must be *told to the model* and leave the table untouched.
+
+    A silent drop was the old behaviour and it was worse than useless: the model
+    could not tell "stored" from "rejected", so it had no way to correct a body
+    that really was too short.
+    """
+    index = _seeded(store, tmp_path)
+    before = len(store.summaries_for("G_demo"))
+
+    def grounded(**kw):
+        rt = _RT("G_demo", store=store, index=index, **kw)
+        return rt
+
+    rt = grounded(instruction="总结一下")
+    await recent_messages.coroutine(limit=10, runtime=rt)
+    short = await save_summary.coroutine(content="太短了", runtime=rt)
+    assert "未入库" in short and "直接回答" in short, "过短的投稿要被拒并给出建议"
+
+    cold = await save_summary.coroutine(
+        content=LONG_DOC, runtime=grounded(instruction="总结一下")
+    )
+    assert "没有读过任何" in cold, "零取数不能立档（防凭会话记忆编文档）"
+
+    gated = await save_summary.coroutine(
+        content=LONG_DOC,
+        runtime=grounded(instruction="总结一下", allow_publish=False),
+    )
+    assert "不允许写入" in gated, "allow_publish=False 时拒绝（离线 ask 的闸）"
+
+    capped = grounded(instruction="总结一下", allow_publish=True)
+    await recent_messages.coroutine(limit=10, runtime=capped)
+    monkeypatch.setattr(config.summary, "max_publish_per_run", 1)
+    assert "已入库" in await save_summary.coroutine(content=LONG_DOC, runtime=capped)
+    again = await save_summary.coroutine(content=LONG_DOC, runtime=capped)
+    assert "达到上限" in again, "每轮投稿上限生效（防碎片化与反复重投）"
+
+    assert len(store.summaries_for("G_demo")) == before + 1, "只有那一次合法投稿落了行"
+
+
+async def test_envelope_ignores_library_reads(store, tmp_path) -> None:
+    """🔴 The duplicate guard must not feed on itself.
+
+    Reading the library proves a run is grounded, but it must **not** widen the
+    coverage envelope — otherwise a document written after a duplicate check
+    inherits the newest existing `ts_end`, every later overlap query hits it, and
+    the rule inverts into "never publish again".
+    """
+    index = _seeded(store, tmp_path)
+    # One more document, covering a window **later than any message in the group**
+    # (messages top out at 01:00). Without it, "envelope from the library" and
+    # "envelope from the messages" would land on the same timestamp here and the
+    # assertion below could not tell the two bugs apart.
+    store.insert_summary(
+        group_openid="G_demo",
+        instruction="更晚的一篇",
+        content="覆盖到 09:00 的旧稿。",
+        coverage=[("2026-07-21T08:00:00+08:00", "2026-07-21T09:00:00+08:00")],
+        message_count=7,
+    )
+
+    rt = _RT("G_demo", store=store, index=index, instruction="总结一下")
+    listed = await summaries_in_range.coroutine(
+        start_iso=WEEK[0], end_iso=WEEK[1], runtime=rt
+    )
+    assert "更晚的一篇" in listed, "清单列出了覆盖该时段的稿子"
+    assert not rt.context.coverage.is_empty(), "查库算落过地"
+    assert rt.context.coverage.intervals() == [], "但不得进覆盖包络"
+
+    # A pure synthesis answer is still publishable — it read real documents —
+    # yet the row it writes carries **no** window, not a borrowed one.
+    out = await save_summary.coroutine(content=LONG_DOC, runtime=rt)
+    assert "已入库" in out, "读库做的综合稿允许投稿"
+    written = [r for r in store.summaries_for("G_demo") if r["content"] == LONG_DOC.strip()]
+    assert written[0]["ts_end"] is None and written[0]["ts_start"] is None, (
+        "包络不能混进被查到的旧稿时段——否则下一次重叠查询必然命中自己"
+    )
+    assert written[0]["message_count"] == 0, "读库不计入消息条数"
+
+    # And a run that reads messages *plus* the library reports only the messages.
+    mixed = _RT("G_demo", store=store, index=index, instruction="总结一下")
+    await summaries_in_range.coroutine(start_iso=WEEK[0], end_iso=WEEK[1], runtime=mixed)
+    await recent_messages.coroutine(limit=10, runtime=mixed)
+    await save_summary.coroutine(content=LONG_DOC, runtime=mixed)
+    # `summaries_for` is newest-first, and both rows share a one-second
+    # `created_at`, so the row this call just wrote is index 0, not -1.
+    row = [r for r in store.summaries_for("G_demo") if r["content"] == LONG_DOC.strip()][0]
+    assert _hh(row["ts_end"]) == "01:00", (
+        f"时段止于真正读过的最晚消息（01:00），不是库里那篇的 09:00，实得 {row['ts_end']}"
+    )
+    assert _hh(row["ts_start"]) == "00:00", "起点同样只来自消息"
+    assert row["message_count"] == 2, "条数也只算消息"
+
+
+async def test_summaries_in_range_uses_coverage_window(store, tmp_path) -> None:
+    index = _seeded(store, tmp_path)
+    rt = _RT("G_demo", store=store, index=index)
+
+    hit = await summaries_in_range.coroutine(
+        start_iso="2026-07-21T00:00:00+08:00",
+        end_iso="2026-07-21T02:00:00+08:00",
+        runtime=rt,
+    )
+    assert "总结一下" in hit, "命中覆盖该时段的本群稿"
+    assert "别群" not in hit and "红色狐狸" not in hit, "恒带群过滤，看不到别群"
+
+    # The row this documents is the point of the whole axis choice: every seeded
+    # summary was *created* just now (so a "last N by created_at" list would show
+    # all of them), but none of them covers October. Asking about "today" must
+    # answer "nothing yet", because that is the honest dedup signal.
+    empty = await summaries_in_range.coroutine(
+        start_iso="2026-10-10T00:00:00+08:00",
+        end_iso="2026-10-10T23:59:59+08:00",
+        runtime=_RT("G_demo", store=store, index=index),
+    )
+    assert "还没有任何总结" in empty, "按覆盖时段判断，不按生成时间"
+
+    # 07-20 的那篇只到 01:00，查 07-21 之后不应命中——重叠是真的重叠。
+    edge = await summaries_in_range.coroutine(
+        start_iso="2026-07-21T01:00:00+08:00",
+        end_iso="2026-07-21T01:00:00+08:00",
+        runtime=_RT("G_demo", store=store, index=index),
+    )
+    assert "总结一下" in edge, "端点算重叠（<= / >= 含两端）"
+
+    bad = await summaries_in_range.coroutine(
+        start_iso="昨天", end_iso="今天", runtime=_RT("G_demo", store=store, index=index)
+    )
+    assert "无法解析" in bad, "时间解析失败返回提示而不是抛异常"
+
+    nogroup = await summaries_in_range.coroutine(
+        start_iso=WEEK[0], end_iso=WEEK[1], runtime=_RT(None, SCOPE_ALL, store=store, index=index)
+    )
+    assert "没有群上下文" in nogroup, "私聊 scope 拿不到本群清单（该工具也不在 C2C_TOOLS 里）"
+
+
+async def test_summaries_in_range_truncation_is_announced(store, tmp_path) -> None:
+    """A silently short list is worse than none: the model would read "these are
+    the summaries" as "these are **all** the summaries"."""
+    index = _seeded(store, tmp_path)
+    for n in range(3):
+        store.insert_summary(
+            group_openid="G_demo",
+            instruction=f"第 {n} 次总结",
+            content=f"内容 {n}",
+            coverage=[("2026-07-21T00:00:00+08:00", f"2026-07-21T0{n}:30:00+08:00")],
+            message_count=n + 1,
+        )
+    out = await summaries_in_range.coroutine(
+        start_iso="2026-07-21T00:00:00+08:00",
+        end_iso="2026-07-21T09:00:00+08:00",
+        limit=2,
+        runtime=_RT("G_demo", store=store, index=index),
+    )
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert any("共" in ln and "只列" in ln for ln in lines), "必须给出真实总数"
+    assert "如需更早" in out, "并建议缩小范围"
+    listed = [ln for ln in lines if "｜" in ln]
+    assert len(listed) == 2, "仍然只列 limit 篇"
+
+
+async def test_two_publishes_in_one_run_share_one_envelope(store, tmp_path) -> None:
+    """Splitting two topics into two documents is allowed, and both inherit the
+    same cumulative window. Documented simplification, pinned here so it stays a
+    choice rather than an accident: the tool cannot know which rows fed which
+    body, because reading and writing are one pass through the model.
+    """
+    index = _seeded(store, tmp_path)
+    rt = _RT("G_demo", store=store, index=index, instruction="按话题分别总结")
+    await recent_messages.coroutine(limit=10, runtime=rt)
+    first = await save_summary.coroutine(content=LONG_DOC, runtime=rt)
+    second = await save_summary.coroutine(content=LONG_DOC + "\n补充段。", runtime=rt)
+    assert "已入库" in first and "已入库" in second, "上限内可以投两篇"
+
+    written = [r for r in store.summaries_for("G_demo") if "补充段" in r["content"] or r["content"] == LONG_DOC.strip()]
+    assert len(written) == 2, "两行，不是一行覆盖一行"
+    assert {str(r["ts_end"]) for r in written} == {str(written[0]["ts_end"])}, (
+        "同一份累计包络（已知简化）"
+    )
+
+    third = await save_summary.coroutine(content=LONG_DOC, runtime=rt)
+    assert "达到上限" in third, "第三篇被上限挡住"
+
+
+async def test_listing_label_is_the_instruction_minus_mention_markup(store, tmp_path) -> None:
+    """The listing has no title column, so it renders `instruction`.
+
+    Three shapes all have to read as something, not as blank or as an openid:
+    a real summon (QQ prefixes `<@32-hex>`), a plain ask, a long ask that must be
+    cut, and the bare-@ case where `body()` is empty.
+    """
+    index = _seeded(store, tmp_path)
+    for ref, instruction in (
+        ("A", "<@A1B2C3D4E5F60718293A4B5C6D7E8F90> 总结一下今天聊了什么"),
+        ("B", "总结一下"),
+        ("C", ""),  # 裸 @：body() 剥掉提及后可能什么都不剩
+        ("D", "把" + "上周的部署讨论" * 12 + "整理一下"),
+    ):
+        store.insert_summary(
+            group_openid="G_demo", instruction=instruction, content=f"正文 {ref}",
+            coverage=[("2026-08-01T00:00:00+08:00", "2026-08-01T01:00:00+08:00")],
+            message_count=1,
+        )
+    out = await summaries_in_range.coroutine(
+        start_iso="2026-08-01T00:30:00+08:00", end_iso="2026-08-01T00:40:00+08:00",
+        limit=20, runtime=_RT("G_demo", store=store, index=index),
+    )
+    lines = "\n".join(out.splitlines())
+    assert "<@A1B2" not in lines, "@ 标记不能占掉整行标题位（真机 instruction 就带它）"
+    assert "总结一下今天聊了什么" in lines, "剔掉标记后剩下的才是人话"
+    assert "（无指令）" in lines, "空指令显示占位而不是空白"
+    assert "把上周的部署讨论" in lines and "…" in lines, "长指令被截断且看得出来被截断"
+
+
+async def test_get_summary_reads_one_document_by_short_id(store, tmp_path) -> None:
+    index = _seeded(store, tmp_path)
+    own = [r for r in store.summaries_for("G_demo")][0]
+    foreign = [r for r in store.summaries_for("G_other")][0]
+
+    out = await get_summary.coroutine(
+        summary_ref=own["summary_id"][:8],
+        runtime=_RT("G_demo", store=store, index=index),
+    )
+    assert own["content"] in out, "按短 id 读到正文"
+    assert "已入库总结" in out, "带一个能辨认的表头"
+
+    denied = await get_summary.coroutine(
+        summary_ref=foreign["summary_id"][:8],
+        runtime=_RT("G_demo", store=store, index=index),
+    )
+    assert "无权" in denied, "别群的 id 拦在群 scope 外（短 id 可猜，不靠运气）"
+
+    missing = await get_summary.coroutine(
+        summary_ref="abc", runtime=_RT("G_demo", store=store, index=index)
+    )
+    assert "找不到" in missing, "太短/不存在的 id 给明确提示"
+
+    # "No group context" must not be read as "every group" — the tool is only in
+    # the group set, so this branch is a wiring mistake, and the fail-open version
+    # of it would be a cross-group read.
+    noScope = await get_summary.coroutine(
+        summary_ref=own["summary_id"][:8],
+        runtime=_RT(None, SCOPE_ALL, store=store, index=index),
+    )
+    assert "没有群上下文" in noScope and own["content"] not in noScope, "无群 scope 直接拒"
+
+    capped = _RT("G_demo", store=store, index=index)
+    monkeypatch_reads = config.summary.max_doc_reads
+    config.summary.max_doc_reads = 1
+    try:
+        await get_summary.coroutine(summary_ref=own["summary_id"][:8], runtime=capped)
+        again = await get_summary.coroutine(
+            summary_ref=own["summary_id"][:8], runtime=capped
+        )
+        assert "已达上限" in again, "每轮读取篇数有上限"
+    finally:
+        config.summary.max_doc_reads = monkeypatch_reads
+
+    assert capped.context.coverage.intervals() == [], "读正文不进包络（同上一条测试的理由）"
+
+
 # ---- real agent runs (ToolNode injection, end to end) ------------------------
 
 
@@ -412,6 +752,85 @@ async def test_real_toolnode_keeps_search_scoped(store, tmp_path) -> None:
     assert not ctx.coverage.is_empty(), "coverage 随 context 对象传出"
 
 
+def _read_call() -> AIMessage:
+    """Ground the run first: publishing requires having read something this run.
+
+    Deliberately part of the sequence rather than a relaxed check — a model that
+    could write a document from conversation memory alone is the failure this
+    guard exists for.
+    """
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": "recent_messages", "args": {"limit": 10}, "id": "call_read"}],
+    )
+
+
+def _publish_call() -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "save_summary",
+                # The model is only ever allowed to supply the body. Everything
+                # else about this row — which group, who asked, which entry
+                # point — is read from the injected context, so smuggling a
+                # `group_openid` here must buy it nothing.
+                "args": {"content": LONG_DOC, "group_openid": "G_other"},
+                "id": "call_pub",
+            }
+        ],
+    )
+
+
+async def test_real_toolnode_publishes_only_where_it_was_asked(store, tmp_path) -> None:
+    """The publishing decision taken through the **real** ToolNode.
+
+    The direct-coroutine tests above bypass `_parse_input` and the stripped-args
+    machinery, so they cannot prove the boundary that matters here: a model that
+    names another group in a `save_summary` call must still write into *its own*.
+    """
+    index = _seeded(store, tmp_path)
+    before = {r["summary_id"] for r in store.summaries_for(None)}
+    summarizer = Summarizer(
+        store,
+        index,
+        model=ToolCallingFakeModel(responses=[_read_call(), _publish_call(), _final()]),
+    )
+    result = await summarizer.summarize_group(
+        "G_demo", "总结一下今天", requested_by="M_ming", trigger="at"
+    )
+
+    assert result.published, "投稿被带出 graph（context 按引用传出，同 coverage）"
+    assert result.text == FINAL_TEXT, "回群的是模型最后那句话，不是正文"
+    assert result.published_text == LONG_DOC.strip(), "入库的是投稿正文"
+
+    new = [r for r in store.summaries_for(None) if r["summary_id"] not in before]
+    assert len(new) == 1, "一次投稿一行，没有多写"
+    assert new[0]["group_openid"] == "G_demo", "写进的是注入的那个群，不是模型填的 G_other"
+    assert new[0]["requested_by"] == "M_ming" and new[0]["trigger"] == "at", (
+        "provenance 由调用方给，模型改不了"
+    )
+
+
+async def test_real_toolnode_publishing_is_refused_when_gated(store, tmp_path) -> None:
+    """`allow_publish=False` must hold through the real injection path too.
+
+    This is the gate the offline `ask` command relies on: the tool is bound into
+    the graph at construction, so a hand-run query is stopped by context, not by
+    a different tool set.
+    """
+    index = _seeded(store, tmp_path)
+    before = {r["summary_id"] for r in store.summaries_for(None)}
+    summarizer = Summarizer(
+        store, index, model=ToolCallingFakeModel(responses=[_publish_call(), _final()])
+    )
+    result = await summarizer.summarize_group(
+        "G_demo", "总结一下今天", allow_publish=False
+    )
+    assert not result.published, "闸门关掉后没有投稿"
+    assert {r["summary_id"] for r in store.summaries_for(None)} == before, "一行都没多"
+
+
 async def test_thread_namespace_lru_and_locks(store, tmp_path) -> None:
     index = _seeded(store, tmp_path)
     final = _final()
@@ -437,6 +856,16 @@ async def test_thread_namespace_lru_and_locks(store, tmp_path) -> None:
 
 
 def test_storable_rules_and_rejects(store) -> None:
+    """The **code-side** floor — which now only gates the fallbacks.
+
+    The `@` path no longer comes through here (the model publishes through
+    `save_summary`), so what these lines really protect is the auto-summary
+    fallback and `ask --save`. The auto fallback's floor stays deliberately low
+    (`MIN_DOC_CHARS`, not the publishing tool's higher `min_publish_chars`): its
+    trigger counts messages since the last stored row, and a row that refused to
+    be written would leave that count unreset — the same batch re-summarised
+    every cooldown, forever. See `store_summary`'s docstring.
+    """
     # "Is this answer a document?" — all three conditions are required.
     grounded = CoverageLog()
     grounded.add(
@@ -463,6 +892,24 @@ def test_storable_rules_and_rejects(store) -> None:
         is None
     ), "不合格的回答不入库"
     assert len(store.summaries_for(None)) == 3, "库里仍只有 3 篇"
+
+    # The fallback yields to a publish, or one auto run would leave two rows for
+    # one coverage window: the model's, plus this one beside it.
+    already = SummaryResult(
+        text=text, coverage=grounded, published_ids=["x" * 32], published_text=text
+    )
+    assert (
+        store_summary(
+            store,
+            group_openid="G_demo",
+            instruction="总结一下",
+            requested_by=None,
+            result=already,
+            trigger="auto",
+        )
+        is None
+    ), "模型已投稿时，代写必须让路"
+    assert len(store.summaries_for(None)) == 3, "一次运行不会落两行"
 
 
 async def test_same_thread_is_serialised(store, tmp_path) -> None:

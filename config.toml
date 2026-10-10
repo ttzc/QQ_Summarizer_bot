@@ -57,6 +57,12 @@ max_reply_chars        = 1500
 max_replies            = 5      # 官方硬上限：单条消息最多被动回复 5 次
 passive_reply_deadline_s = 270  # 距 5 分钟窗口过近时改用主动消息
 
+# 「这一轮算不算一篇文档」由 agent 自己决定（save_summary 工具），
+# 下面三条只是它周围的地板与预算，不是判据本身。
+min_publish_chars      = 200  # 投稿正文的下限；⚠️ 自动总结的兜底门槛不跟着抬（留在 30 字，见 CLAUDE.md §4.1.1）
+max_publish_per_run    = 2    # 一次回答最多投稿几篇（允许按话题拆两篇，同时卡住碎片与反复重投）
+max_doc_reads          = 3    # 一次回答最多完整读几篇已有总结（清单便宜、正文不便宜）
+
 [auto_summary]
 # 消息攒够 min_messages 条就自动总结一次，不需要有人 @ 机器人。
 # 不想要就把 enabled 关掉。

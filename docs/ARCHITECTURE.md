@@ -98,7 +98,7 @@ flowchart TB
     DISPATCH --> INGEST{"5a. _ingest(record)<br/>INSERT OR IGNORE 插入了几条？"}
     INGEST -->|"0 条 = 重复事件"| DROP["直接 return<br/>（这里不唤醒索引器，见 §四.5）"]
     INGEST -->|"1 条 = 新消息"| MENTION{"5b. record.mentions_bot() ?"}
-    MENTION -->|"是"| RESPOND["_respond(record)<br/>交给群 agent，trigger='at'"]
+    MENTION -->|"是"| RESPOND["_respond(record)<br/>交给群 agent，provenance trigger='at'<br/>（成不成文档由 agent 投稿决定）"]
     MENTION -->|"否"| AUTOPATH["_maybe_auto_summarize(group_openid)<br/>① 开关 / 群白名单<br/>② 内存冷却 cooldown_s<br/>③ 本群是否已有总结在跑<br/>④ 计数 ≥ min_messages ？<br/>⑤ 冷却先写，再 await（见 §四.12）"]
 ```
 
@@ -115,8 +115,8 @@ flowchart TB
     A3 --> A4["group_agent.ainvoke(messages,<br/>config = thread_id: 'G:openid',<br/>context = BotContext(group_openid, store, index, scope='group'))"]
     A4 --> A5["2. agent 内部循环（模型自选工具）<br/>current_time → 把「今天 / 上周」换算成 ISO 区间<br/>recent_messages → 最近 N 条<br/>messages_in_range → 时间区间<br/>search_summaries → 对本群已有的总结做语义检索<br/>每个工具都从 runtime.context 读 group_openid（模型无法指定）<br/>取数时顺手把覆盖范围记进 ctx.coverage"]
     A5 --> A6["3. extract_reply(messages)<br/>最后一条非空 AI 消息；空则用 NO_ANSWER"]
-    A6 --> A7["4a. store_summary(..., trigger='at')<br/>是一篇文档就写 summaries 表 + wake_indexer()"]
-    A7 --> A8["4b. reply_chunked(api, group, msg_id, text, elapsed_s)<br/>先存后发，且互不依赖"]
+    A6 --> A7["4a. agent 若判断这一轮是文档 → 调 save_summary(content)<br/>工具内部 insert_document 落库（早于回群）<br/>没投稿就什么都不写"]
+    A7 --> A8["4b. reply_chunked(api, group, msg_id, text, elapsed_s)<br/>回群只发模型的要点答复；与存不存互不依赖<br/>_note_publish：投过稿才唤醒索引器"]
 ```
 
 ### 3.3 回答一次私聊
@@ -130,7 +130,7 @@ flowchart TB
     B5 --> B6["3. reply_chunked(api, user_openid, msg_id, text, kind='c2c')"]
 ```
 
-**私聊消息不写 `group_messages`**：那张表的 `group_openid` 是 `NOT NULL`，而 C2C 作者带的是 `user_openid`，两条解析路径根本不能复用。**私聊回答也不入库**——它是由总结（和原文）派生的，存下来就是"总结的总结"，自我污染；而且它没有唯一归属的群。
+**私聊消息不写 `group_messages`**：那张表的 `group_openid` 是 `NOT NULL`，而 C2C 作者带的是 `user_openid`，两条解析路径根本不能复用。**私聊回答也不入库**——它是由总结（和原文）派生的，存下来就是"总结的总结"，自我污染；而且它没有唯一归属的群（`summaries.group_openid` 是 `NOT NULL`）。所以投稿工具只进 `GROUP_TOOLS`，私聊 scope 连工具都看不见，`allow_publish` 也一并关掉（双保险）。
 
 `messages_across_groups(start_iso, end_iso, group=?, keyword=?, limit=?)` 是私聊独有的取原文工具，两点设计：
 
@@ -155,7 +155,7 @@ flowchart TB
     C5 -->|"否"| SKIP5["跳过"]
     C5 -->|"是"| MARK["⑥ _last_auto[group] = now<br/>写在尝试之前"]
     MARK --> RUN["await _auto_summarize(group)<br/>summarize_group(group, auto_summary.instruction)<br/>与 @ 路径共用 G:openid 线程与锁<br/>整段 try/except：失败只记日志<br/>（冷却已经在⑥花掉了）"]
-    RUN --> STORE["_store_summary(..., requested_by=None, trigger='auto')<br/>先落库，与是否 notify 无关"]
+    RUN --> STORE["模型投稿了 → 用它那篇；没投稿 → _store_summary 代写<br/>(requested_by=None, trigger='auto')<br/>先落库，与是否 notify 无关<br/>计数必须归零，否则同一批消息每个冷却周期重烧"]
     STORE --> NDOC{"是一篇文档<br/>且 notify = true ？"}
     NDOC -->|"否"| END1["结束"]
     NDOC -->|"是"| PUSH["reply_chunked(api, group, msg_id=None,<br/>'〔自动总结〕' + 正文)<br/>主动消息"]
@@ -232,12 +232,12 @@ async def _bot_login(self, token) -> None:
 
 **问题**：最初的实现把每条群消息 embed 成一个向量文档。两个后果：活跃群里"哈哈哈""+1""收到"各占一个向量槽位，把语义空间稀释；以及检索粒度错位——问"之前有人提过部署方案吗"，命中的是碰巧共用某个词的碎片，而不是那段讨论的结论。
 
-**决策**：**只索引总结**。被 @ 总结成功后写一行 `summaries`，后台再把这一行 embed 成一篇文档。原文仍留在 SQLite，继续支持按时间范围/条数取，但不再参与语义检索。
+**决策**：**只索引总结**，且**由 agent 决定哪一次 @ 值得成为总结**。投稿成功写一行 `summaries`，后台再把这一行 embed 成一篇文档。原文仍留在 SQLite，继续支持按时间范围/条数取，但不再参与语义检索。
 
 **由此固定的三条边界**（写进了 prompt 与文档，不是实现细节）：
 
-1. 没有生成过总结的话题，语义检索找不到——**不是"没被 @ 过的就找不到"**：到量自动总结会把没人想着召唤机器人的讨论也变成文档（§四.12）。门槛从"有人想到 @ 机器人"降成"消息攒够阈值"。
-2. 文档的产生**只有两种触发**：被 @（`trigger='at'`）与到量自动（`trigger='auto'`）。没有"每天 9 点日报"式的定时生成——那是另一种产品（时间驱动），本项目是流量驱动。
+1. 没有成稿的话题，语义检索找不到——**不是"没被 @ 过的就找不到"**：到量自动总结会把没人想着召唤机器人的讨论也变成文档（§四.12），门槛从"有人想到 @ 机器人"降成"消息攒够阈值"。但反过来成立：**被 @ 过也可能没成稿**，因为投不投稿由 agent 判断（小问答就是一次问答）。
+2. 文档的产生**只有三个来源**：被 @ 且 agent 调了 `save_summary`（`trigger='at'`）、到量自动（模型投稿或代码代写，`trigger='auto'`）、离线 `ask --save`（`trigger='at'`）。`trigger` 记的是**入口**不是决定者，所以只有两个值。没有"每天 9 点日报"式的定时生成——那是另一种产品（时间驱动），本项目是流量驱动。
 3. 唤醒索引器的位置从"每条消息"搬到"每次总结入库"——否则索引器会被每条群消息唤醒、空转，而真正需要索引的那次插入反而没人唤醒。
 
 `trigger` 列落在 `summaries` 表上，用于审计"知识库里有多少是机器人自己攒的"：`qqbot summaries` 会把它显示出来，SQL 里也能直接分组统计。
@@ -250,8 +250,8 @@ async def _bot_login(self, token) -> None:
 
 **决策**：两套工具集、两个 `create_agent` 图，共享同一个模型与同一个 checkpointer。
 
-- `GROUP_TOOLS = current_time / recent_messages / messages_in_range / search_summaries`，其中 `search_summaries` 恒带 `filter={"group_openid": ...}`。**群 agent 的工具集里没有跨群工具，一个都没有。**
-- `C2C_TOOLS = current_time / search_summaries / list_groups / messages_across_groups`，其中 `search_summaries` 不带过滤。
+- `GROUP_TOOLS = current_time / recent_messages / messages_in_range / search_summaries / view_image / summaries_in_range / get_summary / save_summary`（8 个），其中 `search_summaries` 与 `summaries_in_range` 恒带群过滤。**群 agent 的工具集里没有跨群工具，一个都没有。** 反过来，投稿能力也只在这里：私聊拿不到 `save_summary`。
+- `C2C_TOOLS = current_time / search_summaries / list_groups / messages_across_groups / view_image`（5 个），其中 `search_summaries` 不带过滤。
 
 **为什么不用一个 agent + 运行时 `if ctx.scope`**：`create_agent` 在构造期绑定工具，单个 agent 必须**持有**跨群工具，安全就退化成"每次调用都记得检查 scope"——正是 `tools.py` 的设计要消除的那类 bug。拆成两个图之后，群 agent 的图里**根本不存在**跨群能力。
 
@@ -358,6 +358,26 @@ botpy 的 HTTP 层在**超时**时只打日志、不抛异常，函数就此隐�
 代价是每条消息多一次 `COUNT`——所以 schema 里加了 `idx_gm_group_ingested(group_openid, ingested_at)`，让它变成一次索引区间扫描而不是全表统计。
 
 计数用 `ingested_at`（**入库时刻**）而不是消息自带的 `ts`：问的是"之后我们又收到了多少条"，与发言人自报的时间戳无关（那个字段可能是假的、缺的，或带偏移）。两者格式同源（都是 `_now()` 的本地时间字符串），所以可以用 `datetime()` 包一层直接比较。
+
+### 4.14 为什么"算不算一篇文档"交给 agent，而不是代码判
+
+**问题**：`@` 机器人的消息有两类——"总结一下今天"（要的是一篇能重读的稿子）和"有没有人提过 X"（要的是一个直接答案）。原先代码对两者一视同仁：每次 @ 跑完都调 `store_summary()`，只用 `storable()` 的三个启发式（非哨兵 / ≥30 字 / 落过地）过滤。后果是知识库被小问答稀释——一句"有人提过，08:12 小明说过……"就成了一篇文档，而它的覆盖范围毫无意义。
+
+**决策**：**判据搬进模型**。`GROUP_TOOLS` 多一个 `save_summary(content)`：模型认为这一轮值得长期留存时才调它，正文由它自己写好、工具直接落库；不调就什么都不写。代码这边只留下限与预算（`min_publish_chars` / `max_publish_per_run`），且**校验不过是把原因作为文本返回给模型**——它能改正再投，而不是像以前那样被静默丢弃。
+
+配套给了它做判断所需的**原始料**（而不是一个派生指标）：
+
+- `summaries_in_range(start_iso, end_iso, limit)`——按**覆盖时段重叠**查本群库里有哪些稿子。轴选时段不选 `created_at`：投稿稿可能"今天生成、覆盖上周三"，按"最近 N 篇"排序恰好会把它排到最前，而判断重复需要的是"这段讨论写过没有"。空返回本身就是答案（"这段还没人写过"）。`limit` 只是截断护栏，命中超出时**必须报出真实总数**——一个看起来完整的短清单会让模型误判"库里就这些"，然后照投重复稿。
+- `get_summary(summary_ref)`——按短 id 读某一篇正文，每轮限 `max_doc_reads` 篇（清单便宜、正文不便宜）。
+
+**为什么自动总结路径不受这条管**：它的门禁是**计数**（距上次入库新增 ≥ `min_messages` 条），本身就是"有没有新增内容"的答案；而且它是知识库的主粮——把入库与否也交给模型表态，一次漏调就白烧一轮 + 一个 30 分钟冷却。所以自动路径保持"必然写一行"（模型投稿了就用它那篇，没投稿时代写 `result.text`）。
+
+**两个由此产生的硬约束**（都有测试钉着）：
+
+1. 🔴 **读库动作不得进覆盖包络**。`CoverageLog` 有两个职责：`intervals()` 是这篇文档的覆盖窗口（写进 `ts_start`/`ts_end`），`is_empty()` 是这一轮落没落过地。`summaries_in_range` / `get_summary` 记 `envelope=False` 的读——否则"为防重复先查一次库"会让新文档继承库里最晚的 `ts_end`，此后每次重叠查询都命中自己，判据反转为"什么都别再投"。
+2. 🔴 **一次运行只能落一行**。`store_summary()` 在 `result.published` 非空时直接返回 `None`；少了这个短路，自动路径会出现"模型投的 + 代码代写的"两行同覆盖范围的稿子。
+
+**接受的代价**：判据偏保守时 @ 路径贡献变少（由自动路径兜底）、群里不再直接收到全文（只给要点，全文在库里）、以及"库里近重复"没有被代码硬拦（靠模型自查，残余重复可接受——多篇并存不损坏检索，只是噪音）。观察点是 `logs/app.log` 的 `答复判定为问答，未入库` 频率与 `qqbot stats` 的成稿数 / 待总结数。
 
 ---
 

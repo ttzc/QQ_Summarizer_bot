@@ -10,7 +10,7 @@ QQ 群消息总结机器人：接入 QQ 官方机器人（群聊能力）接收�
 
 ## 项目现状
 
-**实现已完成（脱机可验证部分）**：脱机测试套件（pytest **51 项**，`tests/` 按主要功能分文件）全绿。未完成的只剩真机联调（见 §五）。
+**实现已完成（脱机可验证部分）**：脱机测试套件（pytest **72 项**，`tests/` 按主要功能分文件）全绿。未完成的只剩真机联调（见 §五）。
 
 ```mermaid
 flowchart LR
@@ -567,9 +567,9 @@ flowchart TB
     MQ -->|"否"| CHK["距本群上次总结新增 ≥ min_messages<br/>且过了冷却期？<br/>（同步判定，见 §4.1.3）"]
     CHK -->|"是"| AU["Summarizer agent（同一条群会话）<br/>用 [auto_summary].instruction 总结"]
 
-    GA -->|"先落库"| SUM["② summaries 表<br/>一次总结一行，trigger = at / auto"]
-    AU -->|"先落库"| SUM
-    GA -->|"再回群"| RC["reply_chunked() 回群<br/>切段 ≤1500 字、最多 5 段、msg_seq 递增<br/>超 5 分钟窗口 → 降级为主动消息"]
+    GA -->|"agent 自己判断值不值得留存<br/>调 save_summary 才落库"| SUM["② summaries 表<br/>一行 = 一篇投稿，trigger = at / auto"]
+    AU -->|"模型没投稿时代写<br/>（计数门禁必须归零）"| SUM
+    GA -->|"回群只发要点，不重抄正文"| RC["reply_chunked() 回群<br/>切段 ≤1500 字、最多 5 段、msg_seq 递增<br/>超 5 分钟窗口 → 降级为主动消息"]
     SUM -->|"唤醒后台 indexer"| CH[("③ Chroma<br/>一篇总结一个文档")]
     SUM -->|"notify = true 才发"| PUSH["把自动总结作为主动消息发到群里<br/>（默认静默，只入库）"]
 
@@ -597,23 +597,30 @@ flowchart TB
 - Chroma 的 `metadata` **只用标量**（`str|int|float|bool`）。chromadb 1.5.9 实际容忍 `list`/`None`，只有嵌套 dict 会在插入时炸；用标量是因为它们正是等值过滤器操作的类型。
 - 群内检索**强制带** `filter={"group_openid": ...}`；私聊检索则**故意不带**（那是它的全部意义）。两条相反的规则由两个 agent 的工具集表达，不由运行时 `if` 表达。
 
-### 4.1.1 文档单位是「一次总结」，不是「一条消息」
+### 4.1.1 文档单位是「一次总结」，且**由 agent 决定哪一次算文档**
 
 只索引总结：每条消息一个向量既贵又噪音大（"哈哈哈""+1"各占一个槽位），且检索粒度错位。做法与后果：
 
-- 总结成功后写 `summaries` 一行（`trigger` 记 `at` / `auto`）→ 后台 embed 成一篇文档 → `search_summaries` 检索。
-- 原文仍在 SQLite，`recent_messages` / `messages_in_range` 照常按时间取（私聊另有跨群的 `messages_across_groups`），只是不做语义检索。
-- **代价**：**只有"已经生成过总结"的话题**能被语义检索到——还在阈值以下、又没人 @ 过的讨论查不到，与消息新旧无关。这是"一次总结一篇文档"的必然结果，已写进 prompt、README「已知限制」与 DATA_MODEL §5.2。那段讨论本身没丢，按时间读原文仍能拿到。
+- 写入 `summaries` 一行的唯一路径是 `save_summary` 工具（`src/agent/publish.insert_document` 落库，`trigger` 记 `at` / `auto`）→ 后台 embed 成一篇文档 → `search_summaries` 检索。
+- 🔴 **入库判据在模型手里，不在代码里**（2026-10-10 决定）。此前 `_respond` 对每次 @ 都无条件落库，只用 `storable()` 的三个启发式过滤（非哨兵 + ≥30 字 + coverage 非空）——而 prompt 本来就把 @ 定义成"用户会 @ 你来问问题"，于是"有人提过 X 吗"这种三行字的检索答复也照样成为一篇文档，库里混入大量没有覆盖意义的条目。现在：agent 自己判断这一轮值不值得留存，判断依据写在 `prompts/summarizer.md`「文档还是回答」一节；代码只留下限与预算（`[summary].min_publish_chars` / `max_publish_per_run`），且**拒绝是以文本返回给模型**的（看得见、能改正），不是静默丢弃。
+- **两条代写兜底**（模型没被要求表态的地方）：自动总结路径在模型没投稿时用 `result.text` 代写；离线 `ask --save` 同。`store_summary()` 只在 `result.published` 为空时才写 —— 否则一次自动运行会落两行（模型投稿 + 代码代写同一份 coverage）。
+- 🔴 **自动兜底的长度门槛刻意留在 `MIN_DOC_CHARS`(30)，不要跟着 `min_publish_chars`(200) 抬**。自动触发器数的是「距上次入库新增几条」，拒写 = 计数永不归零 = 每个冷却周期把同一批消息重烧一遍，无限循环。**这个环在判据改动前就存在**（`_store_summary` 返回 None 就是不写行），真要修应当是"存下来 + 打 warning"，而不是提高门槛。
+- **私聊答复仍不入库**：`summaries.group_openid` 是 NOT NULL，跨群答复没有归属地；且它是从已有总结二次加工的，存下来就是总结的总结。群内的"检索后综合回答"**可以**入库（投稿权在群 agent 手里）。
+- **一轮投多篇是允许的**（上限 `max_publish_per_run`，默认 2，用于按话题拆）：每篇都取**当时的累计包络**，所以两篇的 `ts_start`/`ts_end` 相同——已知的简化，不做逐篇切分（那要求工具知道哪条消息被哪篇用掉，取数与写作在模型里是一次性的，切不了）。`notify` 只推**最后一篇**的正文。
+- **代价**：**只有"已经生成过总结"的话题**能被语义检索到——还在阈值以下、又没人 @ 过、以及 @ 了但 agent 判为问答的讨论都查不到，与消息新旧无关。已写进 prompt、README「已知限制」与 DATA_MODEL §5.2。那段讨论本身没丢，按时间读原文仍能拿到。
 - `summary_id` 用 `uuid4().hex` 而不是内容哈希 —— 内容哈希 + `INSERT OR IGNORE` 会把"同群两次同样的套话总结"中的第二次连同它不同的覆盖范围静默吃掉。
-- 记录覆盖范围用 `CoverageLog`（工具取数时顺手 append），`ainvoke` 后从注入的 `BotContext` 上读回来。这依赖 LangGraph **按引用**传 context（`_coerce_context` 对实例原样返回），属实现细节，所以代码里留了一道 warning：有工具调用但 coverage 为空就告警。
-- `SummaryResult.storable()` 三条判据：非哨兵文本 + 长度过底线 + **至少调用过一个取数工具**。最后一条把"总结"和"零工具调用的追问"分开。
+- 记录覆盖范围用 `CoverageLog`（工具取数时顺手 append），`ainvoke` 后从注入的 `BotContext` 上读回来（投稿结果 `published_ids` / `published_text` 走同一条按引用传出的路）。这依赖 LangGraph 对实例**原样返回**（`_coerce_context`），属实现细节，所以代码里留了一道 warning：有工具调用但 coverage 为空就告警。
+- 🔴 **`CoverageLog` 有两个职责，必须分清**：`intervals()` 是这篇文档的**覆盖包络**（写入 `ts_start`/`ts_end`），`is_empty()` 是**这一轮落没落过地**。读库的两个工具（`summaries_in_range` / `get_summary`）记 `envelope=False`：它们证明读过东西，不证明覆盖了那段。若让它们进包络，链子会这样塌：模型为防重复先查库 → 新文档继承库里最晚的 `ts_end` → 之后每次重叠查询都命中自己 → 判据反转为"什么都别再投"。**这条自我命中不会体现在测试里，除非专门造一篇"覆盖时段比所有消息都晚"的旧稿**（`test_envelope_ignores_library_reads` 就是为此）。
+- 判断「有没有新增内容」用的是**原始料**而非派生指标：`summaries_in_range(start,end)` 按**覆盖时段重叠**查（不是 `created_at` 倒序 —— 后者隐含"库里只有自动总结"，而投稿稿可能今天生成、覆盖上周三，正是最该看见却最容易被漏掉的那篇），`limit` 只是截断护栏且**必须在返回里报出真实总数**（静默截断会让模型把"只看到 N 篇"读成"库里只有 N 篇"）。
 
 ### 4.1.2 两个 agent（权限方向相反）
 
 `create_agent` 在构造期绑定工具，所以：
 
-- `GROUP_TOOLS = current_time / recent_messages / messages_in_range / search_summaries`（检索恒带群过滤；**没有**任何跨群能力）。
-- `C2C_TOOLS = current_time / search_summaries / list_groups / messages_across_groups`（检索不过滤；`messages_across_groups` 按时间范围跨群读**原文**）。
+- `GROUP_TOOLS = current_time / recent_messages / messages_in_range / search_summaries / view_image / summaries_in_range / get_summary / save_summary`（共 8 个；检索与库内自查恒带群过滤；**没有**任何跨群能力）。
+- `C2C_TOOLS = current_time / search_summaries / list_groups / messages_across_groups / view_image`（共 5 个；检索不过滤；`messages_across_groups` 按时间范围跨群读**原文**；**没有投稿工具**，见 §4.1.1）。
+- 投稿工具摘不掉但可以被闸：`BotContext.allow_publish`（私聊与离线 `ask`（无 `--save`）都是 False）。工具在构造期绑定，所以"这一轮能不能写"只能挂在按引用传出的 context 上。
+- `DATA_TOOLS` 含读库两个工具（它们确实读了存库数据，漏登记会让 `Summarizer._run` 的告警对诚实回答狂响），但**不含** `save_summary`（写不是读）。
 
 做成一个 agent 再在工具里 `if ctx.scope` 分流，会让群图**包含**跨群能力，安全性退化成运行时检查。两个图共享模型与 checkpointer。
 
@@ -660,7 +667,7 @@ flowchart TB
 
 ## 五、待办 / 下一步
 
-**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结 + media 附件表）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI、**M1 语音 ASR 入库**、**M2 图片落盘 + `view_image` 按需看图**（方案 `docs/MEDIA.md`，表 `DATA_MODEL` §2.7）—— 见 §项目现状，脱机测试（pytest **51 项**）全绿。
+**代码侧已完成的（保留备查）**：依赖（含 `langchain-openai` / `langchain-chroma`）、`.env` + `.gitignore`、继承 `Client` 的解析器、`GroupMessageRecord`、SQLite 存储（原文 + 总结 + media 附件表）、总结级向量索引、群/私聊两个 agent 与工具、**按消息量触发的自动总结**（§4.1.3）、私聊的跨群原文检索、CLI、**M1 语音 ASR 入库**、**M2 图片落盘 + `view_image` 按需看图**（方案 `docs/MEDIA.md`，表 `DATA_MODEL` §2.7）、**入库决定权交给 agent**（`save_summary` 投稿 + `summaries_in_range`/`get_summary` 自查，§4.1.1；2026-10-10，零结构变更）—— 见 §项目现状，脱机测试（pytest **72 项**）全绿。
 
 **剩余（按能否脱机划分为两类）**：
 
@@ -678,10 +685,16 @@ flowchart TB
 - [ ] 真机验证**自动总结真的触发一次**：需要该群攒到 `min_messages`（默认 200）条新消息，或临时把阈值调小；`notify = true` 时还需群主开「机器人主动在群聊内发言」，否则那条主动消息发不出去。
 - [ ] 真机验证**跨群原文检索**：私聊问"把这两天的原始消息列出来"，确认 `messages_across_groups` 的时间边界与 `raw_limit` 在真实网关上表现正常。
 - [ ] 真机验证 **M2 图片管线**：第一条真实图片走完 `pending → stored`（日期桶命名、魔数判定的真机形态）；一次 @ 总结中模型主动调 `view_image` 的全链路（含描述回写与缓存命中）；隔天重放离线积压的 pending，验证 `expired` 是否需要配人工重放。语音的 `asr_refer_text` 覆盖率观察同批处理（当前语料尚无语音消息）。
+- [ ] 真机验证 **投稿判据的实际取向**（2026-10-10 改造后新增的观察项，脱机测不出来）：同一群里分别 @ 一句小问题与一句「总结一下今天」，看 `logs/app.log` 里 `答复判定为问答，未入库` 与 `agent 投稿入库` 各自出现一次，且 `summaries` 只 +1。若几乎**不投稿**（判据偏保守 → 知识库增长变慢），先调 `prompts/summarizer.md` 的判据，再考虑调 `[summary].min_publish_chars`；若**什么都投**（小问题又变成文档了），是判据不够硬，不是门槛数字太低。
+- [ ] 真机观察 `save_summary` 会不会**反复重投**（被拒 → 改几个字再投）。三重上界在位（`max_publish_per_run=2` / `RECURSION_LIMIT=25` / 拒绝文案直说"请直接回答"），但模型在真实网关上的行为只能看日志。
+
+**已知缺陷（本次不修，别当"顺手能好"的东西）**：
+
+- 自动总结的计数环：一篇"跑成功但被代码判为不算文档"的自动总结**不入库**，于是 `messages_since_last_summary` 永不归零，同一批消息会在每个冷却周期被重烧一遍 LLM。改判据之前就存在（`_store_summary` 返回 None 即不写行），本次刻意没动——正解是"**存下来 + 打 warning**"，而**不是**把兜底门槛抬高（§4.1.1 那条红字解释了为什么）。
 
 ### 5.1 多模态（图片 / 语音）—— M1/M2 已实现，本节保留选型与实测记录
 
-**状态（2026-10-10）**：M1（语音 ASR 入库）与 M2（图片落盘 + `view_image` 按需看图 + 描述缓存）已按 `docs/MEDIA.md` 实现，脱机 51 项全绿；真机观察项见 §五。下面的"现状"描述的是 M2 之前的形态，保留作为模型选型与实测依据（其中"URL 时效待定"已被 M2 的落盘策略解耦）。M3（PDF）/ M4（docx/ppt）未动工。
+**状态（2026-10-10）**：M1（语音 ASR 入库）与 M2（图片落盘 + `view_image` 按需看图 + 描述缓存）已按 `docs/MEDIA.md` 实现，脱机 72 项全绿；真机观察项见 §五。下面的"现状"描述的是 M2 之前的形态，保留作为模型选型与实测依据（其中"URL 时效待定"已被 M2 的落盘策略解耦）。M3（PDF）/ M4（docx/ppt）未动工。
 
 - 图片在 `Attachment.label()`（`events.py:89`）里渲染成 `[图片 <filename>]`，而真机的 `filename` 是一串大写十六进制 + 扩展名（形如 `6A3051F3….jpg`），**信息量≈0**。
 - 语音取 `asr_refer_text`（官方文档名"语音消息 ASR **参考**结果"——名字本身不承诺必有），渲染成 `[语音转写 …]`；**没有转写渲染成 `[语音（无转写）]`**（M1，2026-10-09 已实现）——让摘要至少知道这里说过一次话。语音判定认 `content_type` 的 `voice` 与 `audio/*`（官方 2026-09-16 版事件页的枚举就是裸词 `voice`，同页却称该列为"MIME 类型"，图片实际以 `image/jpeg` 到线，故两边都收）；**`message_type` 不可用**——官方没有语音专属值，且官方自己的图片示例与真机库都是 `message_type: 0`。官方 MessageAttachment 另有 **`voice_wav_url`**（QQ 已完成 SILK→WAV 转换，URL 与图片同款 `rkey` 签名结构）：按"音频不入库"的取舍**不解析**，但随逐字 `raw_json` 原样保留，日后想用便宜的原生音频模型时反悔成本为零。⚠️ botpy 1.2.1 的 `_Attachments` **不解析** `asr_refer_text`（site-packages 全文零命中），所以 @ 退路上语音恒进无转写分支；`Attachment.from_object` 已按 `getattr` 读取该字段，SDK 哪天补上即自动生效。真机观察（覆盖率/长度/风格）待第一条语音落库——当前语料语音消息为 0 条（2026-10-09 清点 `data/qqbot.db`，带附件的 5 条全是图片）。多模态的完整计划（含"不存音频文件：能读音频的全模态模型太贵"这条既定取舍）见 [`ROADMAP.md`](ROADMAP.md)。

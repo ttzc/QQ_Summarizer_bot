@@ -186,11 +186,21 @@ class FakeAPI:
 
 
 class FakeSummarizer:
-    """Stands in for `Summarizer`, returning a document-worthy `SummaryResult`.
+    """Stands in for `Summarizer`, and for what the agent's publishing now does.
 
-    The text is deliberately longer than `MIN_DOC_CHARS` and carries a non-empty
-    coverage log, because both are required for the answer to be stored —
-    a fake that returned "摘要：…" would make the storage assertions below vacuous.
+    Two separate jobs, because the storage decision moved: an `@` answer is no
+    longer stored by the bot, it is published *during the run* by the
+    `save_summary` tool. So this fake both returns an answer **and** writes the
+    row that tool would have written, through the same `insert_document` the tool
+    calls. Tests then still assert against real rows — a fake that merely set
+    `published_ids` would make every storage assertion vacuous.
+
+    `publish=False` stands in for the model declining to publish (a question, not
+    a document), which is now the interesting second case.
+
+    The text is deliberately longer than the code-side floors and carries a
+    non-empty coverage log, so the auto-summary *fallback* also has something
+    worth storing when the model does not publish.
     """
 
     TEXT = (
@@ -198,9 +208,12 @@ class FakeSummarizer:
         "小红负责整理会议材料，小刚确认了会议室。"
     )
 
-    def __init__(self):
+    def __init__(self, store=None, publish: bool = True):
+        self.store = store
+        self.publish = publish and store is not None
         self.calls: list[tuple[str, str]] = []
         self.private_calls: list[tuple[str, str]] = []
+        self.kwargs: list[dict] = []
 
     @staticmethod
     def _result(tool: str, rows: int) -> SummaryResult:
@@ -210,12 +223,35 @@ class FakeSummarizer:
         )
         return SummaryResult(text=FakeSummarizer.TEXT, coverage=coverage)
 
-    async def summarize_group(self, group_openid: str, instruction: str) -> SummaryResult:
+    async def summarize_group(
+        self, group_openid: str, instruction: str, **kw
+    ) -> SummaryResult:
         self.calls.append((group_openid, instruction))
-        return self._result("recent_messages", rows=5)
+        # Keep what the bot passed as provenance: a test asserting that
+        # `requested_by` / `trigger` reach the row would otherwise have nothing
+        # to read back, since the fake is what writes the row.
+        self.kwargs.append(kw)
+        result = self._result("recent_messages", rows=5)
+        if self.publish:
+            from src.agent.publish import insert_document
+
+            summary_id = insert_document(
+                self.store,
+                group_openid=group_openid,
+                instruction=instruction,
+                content=self.TEXT,
+                coverage=result.coverage.intervals(),
+                message_count=result.coverage.message_count(),
+                requested_by=kw.get("requested_by"),
+                trigger=kw.get("trigger", "at"),
+            )
+            result.published_ids = [summary_id]
+            result.published_text = self.TEXT
+        return result
 
     async def answer_private(self, user_openid: str, instruction: str) -> SummaryResult:
         self.private_calls.append((user_openid, instruction))
+        # Private answers publish nothing, ever — no tool for it, no owning group.
         return self._result("search_summaries", rows=0)
 
     def group_busy(self, group_openid: str) -> bool:
@@ -227,7 +263,9 @@ class ExplodingSummarizer:
     def __init__(self):
         self.calls: list[tuple[str, str]] = []
 
-    async def summarize_group(self, group_openid: str, instruction: str) -> SummaryResult:
+    async def summarize_group(
+        self, group_openid: str, instruction: str, **kw
+    ) -> SummaryResult:
         self.calls.append((group_openid, instruction))
         raise RuntimeError("LLM 挂了")
 

@@ -112,7 +112,7 @@ detail              = "low"          # 看图调用一律缩到 512×512，摘�
 
 图片文件与 `media` 表不进任何检索路径（`search_summaries` 检索的仍是总结文本）。模型对图的唯一入口是 `view_image`，群内 scope 下受注入的 `group_openid` 硬校验（步骤 2）；返回的是文字，与取数工具同等对待，天然被既有预算与隔离规则覆盖。
 
-## 验收清单（脱机，`tests/test_media.py` — 2026-10-10 起全部落地，套件 51 项）
+## 验收清单（脱机，`tests/test_media.py` — 2026-10-10 起全部落地，套件 72 项）
 
 假件注入：`http_get`（下载器）与 `describe`（一次性视觉调用），真 SQLite + 真文件写入（tmp_path）。
 
@@ -127,7 +127,7 @@ detail              = "low"          # 看图调用一律缩到 512×512，摘�
 9. `describe` 抛异常 → 工具返回可读错误文本，agent 运行不中断。
 10. `max_views` 限流：第 7 次调用返回上限提示，`describe` 只被调 6 次。**额度只扣在真实视觉调用**上——文件缺失、超内联上限这些没走到模型的路径不扣；ref 带空格或 `#`（从占位符直接截取的 `" #4d9f…"`）同样能解析。
 11. 启动时清扫孤儿 `.{sha}.ext.tmp`（上一次进程在 write 与 rename 之间被杀留下的半文件），只清 tmp 不碰成品。
-12. `view_image` 不在 `DATA_TOOLS`：仅调过 view_image 的回答 `storable()` 判定不受影响（`test_agent.py` 的工具集断言：群与私聊各 5 个）。
+12. `view_image` 不在 `DATA_TOOLS`：仅调过 view_image 的回答 `storable()` 判定不受影响（`test_agent.py` 的工具集断言：群 8 个 / 私聊 5 个）。
 
 真机项：第一条真实图片 pending→stored；一次 @ 总结中模型主动调 `view_image` 的全链路；隔天重放验证离线积压场景（决定 expired 是否需要人工重放命令）。
 

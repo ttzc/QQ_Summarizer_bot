@@ -18,6 +18,7 @@ from conftest import (
     SUMMON_MESSAGE,
     frame,
 )
+from src.agent.summarizer import SummaryResult
 from src.bot.client import SummarizerClient
 from src.config import config
 
@@ -82,7 +83,7 @@ async def test_parser_registration_and_dispatch(store, fake_bot_login):
 
 
 async def test_at_message_end_to_end(store, fake_bot_login):
-    summarizer = FakeSummarizer()
+    summarizer = FakeSummarizer(store)
     wakes: list[int] = []
     client, parser = await _start(store, summarizer, wakes)
 
@@ -109,10 +110,12 @@ async def test_at_message_end_to_end(store, fake_bot_login):
     assert len(client.api.sent) == 1, "未 @ 的消息只落库不回复"
     assert len(store.recent_messages("G_demo", 10)) == 2, "未 @ 的消息也落库了"
 
-    # The answer itself is now a document, and it is stored
-    # *before* the send, so a failure to deliver cannot lose it.
+    # The answer became a document because the agent published it — mid-run,
+    # which is *earlier* than the old "store after the run", so a delivery
+    # failure still cannot lose it. `FakeSummarizer` writes the row through the
+    # same `insert_document` the tool uses; see its docstring.
     stored = store.summaries_for("G_demo")
-    assert len(stored) == 1, "被 @ 的回答作为总结落库"
+    assert len(stored) == 1, "agent 投稿的总结落库"
     assert (
         stored[0]["group_openid"] == "G_demo" and stored[0]["message_count"] == 5
     ), "总结记录了群与取数条数"
@@ -125,6 +128,29 @@ async def test_at_message_end_to_end(store, fake_bot_login):
     # the insert that does need indexing is the summary itself.
     assert len(wakes) == 1, "三条消息本身不唤醒索引器"
     assert len(wakes) == 1, "总结入库时唤醒一次索引器"
+
+    # Provenance travels to the publishing tool, not to the model: the row's
+    # `requested_by`/`trigger` can only be right if the client handed them over.
+    assert summarizer.kwargs[0]["requested_by"] == "M_ming", "触发者作为 provenance 传下去"
+    assert summarizer.kwargs[0]["trigger"] == "at", "入口记为 at"
+
+
+async def test_at_answer_that_declines_to_publish_is_not_stored(store, fake_bot_login):
+    """The point of the whole change: a @ that reads messages but is *a question*
+    must not become a document. Storage is no longer the bot's unconditional act,
+    so `publish=False` (the model declined) has to leave the corpus untouched
+    while the group still gets its reply."""
+    summarizer = FakeSummarizer(store, publish=False)
+    wakes: list[int] = []
+    client, parser = await _start(store, summarizer, wakes)
+
+    parser(frame(SUMMON_MESSAGE))
+    await asyncio.sleep(0.05)
+
+    assert len(summarizer.calls) == 1, "照样跑了一轮"
+    assert len(client.api.sent) == 1, "答复仍然发回群里"
+    assert store.summaries_for("G_demo") == [], "没投稿就不入库"
+    assert wakes == [], "没入库就不唤醒索引器"
 
 
 class _Author:
@@ -140,7 +166,7 @@ class FakeC2C:
 
 
 async def test_c2c_flow(store, fake_bot_login):
-    summarizer = FakeSummarizer()
+    summarizer = FakeSummarizer(store)
     wakes: list[int] = []
     client, _ = await _start(store, summarizer, wakes)
 
@@ -185,7 +211,7 @@ async def test_send_failure_still_stores(store, fake_bot_login):
     # summary — a 429 or a timeout would otherwise lose it for good.
     client = SummarizerClient(
         store=store,
-        summarizer=FakeSummarizer(),
+        summarizer=FakeSummarizer(store),
         bot_log=True,
         ext_handlers=False,
     )
@@ -230,7 +256,7 @@ def auto_on(monkeypatch):
 
 
 async def test_auto_summary_threshold_and_cooldown(store, fake_bot_login, auto_on):
-    summarizer = FakeSummarizer()
+    summarizer = FakeSummarizer(store)
     wakes: list[int] = []
     client, parser = await _start(store, summarizer, wakes)
 
@@ -290,10 +316,53 @@ async def test_auto_summary_threshold_and_cooldown(store, fake_bot_login, auto_o
     )
 
 
+async def test_auto_summary_falls_back_when_nothing_published(
+    store, fake_bot_login, auto_on
+):
+    """The auto path stores **even if the model published nothing**.
+
+    Its gate is the message count, and that count is `messages since the last
+    stored row` — so a thin-but-successful summary that went unwritten would
+    leave the count unreset and re-summarise the same batch after every cooldown,
+    forever. This is the reason the auto fallback keeps the *low* code-side floor
+    instead of the publishing tool's higher one.
+    """
+    auto_on.min_messages = 1
+    summarizer = FakeSummarizer(store, publish=False)
+    wakes: list[int] = []
+    client, parser = await _start(store, summarizer, wakes)
+
+    parser(frame(TEXT_MESSAGE))
+    await asyncio.sleep(0.05)
+
+    stored = store.summaries_for("G_demo")
+    assert len(stored) == 1, "模型没投稿时，自动路径仍然代写一行"
+    assert stored[0]["trigger"] == "auto", "代写的行也记 trigger=auto"
+    assert stored[0]["content"] == FakeSummarizer.TEXT, "代写用的是答复正文"
+    assert len(wakes) == 1, "代写同样唤醒索引器"
+
+
+async def test_auto_summary_publishing_model_stores_exactly_one_row(
+    store, fake_bot_login, auto_on
+):
+    """One auto run must never leave two rows.
+
+    The model has every reason to publish under the auto instruction ("请总结本
+    群最近的讨论"), and the code-side fallback would otherwise add a second row
+    for the same coverage right beside it.
+    """
+    auto_on.min_messages = 1
+    client, parser = await _start(store, FakeSummarizer(store, publish=True), wakes=[])
+
+    parser(frame(TEXT_MESSAGE))
+    await asyncio.sleep(0.05)
+    assert len(store.summaries_for("G_demo")) == 1, "投稿与代写没有互踩"
+
+
 async def test_auto_summary_notify_pushes_active_message(store, fake_bot_login, auto_on):
     auto_on.notify = True
     auto_on.min_messages = 1
-    client, parser = await _start(store, FakeSummarizer(), wakes=[])
+    client, parser = await _start(store, FakeSummarizer(store), wakes=[])
     parser(frame(TEXT_MESSAGE))
     await asyncio.sleep(0.05)
 
@@ -305,6 +374,78 @@ async def test_auto_summary_notify_pushes_active_message(store, fake_bot_login, 
     stored = store.summaries_for("G_demo")
     assert len(stored) == 1, "同一篇总结已落库"
     assert stored[0]["content"] == FakeSummarizer.TEXT, "入库的正文不带前缀"
+
+
+class _PublishOnlySummarizer:
+    """Answers with a short remark while the *document* went in through the tool.
+
+    The two texts differ on purpose: this is what the chosen reply shape
+    (群里只发要点，全文进库) produces, and it is the only way to see which of the
+    two the notify branch pushes.
+    """
+
+    DOC = "全文：两小时的部署讨论，结论是周五上线，卡点是测试环境。\n" * 3
+    REMARK = "已收录，覆盖 20:00~22:00 共 18 条。要点：周五上线。"
+
+    def __init__(self, store):
+        self.store = store
+
+    async def summarize_group(self, group_openid, instruction, **kw):
+        from src.agent.publish import insert_document
+        from src.agent.tools import CoverageLog
+
+        coverage = CoverageLog()
+        coverage.add("recent_messages", 18, "2026-10-10T20:00:00+08:00",
+                     "2026-10-10T22:00:00+08:00")
+        sid = insert_document(self.store, group_openid=group_openid,
+                              instruction=instruction, content=self.DOC,
+                              coverage=coverage.intervals(),
+                              message_count=coverage.message_count(),
+                              requested_by=kw.get("requested_by"),
+                              trigger=kw.get("trigger", "at"))
+        return SummaryResult(text=self.REMARK, coverage=coverage,
+                             published_ids=[sid], published_text=self.DOC)
+
+    async def answer_private(self, user_openid, instruction):
+        raise AssertionError("不该走到私聊")
+
+    def group_busy(self, group_openid):
+        return False
+
+
+async def test_notify_pushes_the_document_not_the_remark(store, fake_bot_login, auto_on):
+    """自动总结推的是**库里那篇全文**，不是模型的收尾一句。
+
+    群里没人等答复，推"已收录，覆盖…"等于推了一条关于文件的通告。`@` 路径反过来
+    推要点才是对的，因为那里有人在等。
+    """
+    auto_on.notify = True
+    auto_on.min_messages = 1
+    fake = _PublishOnlySummarizer(store)
+    client, parser = await _start(store, fake, wakes=[])
+
+    parser(frame(TEXT_MESSAGE))
+    await asyncio.sleep(0.05)
+
+    assert len(client.api.sent) == 1, "notify=true 时发一条主动消息"
+    sent = client.api.sent[0]["content"]
+    assert sent.startswith("〔自动总结〕") and "两小时的部署讨论" in sent, (
+        "推送的是全文正文"
+    )
+    assert "已收录" not in sent, "不是模型那句要点"
+    assert store.summaries_for("G_demo")[0]["content"] == fake.DOC, "入库的是同一份全文"
+
+
+async def test_at_path_replies_the_remark_not_the_document(store, fake_bot_login):
+    """同一条改造的另一半：被 @ 时群里收到的就是要点，正文只在库里。"""
+    fake = _PublishOnlySummarizer(store)
+    client, parser = await _start(store, fake, wakes=[])
+
+    parser(frame(SUMMON_MESSAGE))
+    await asyncio.sleep(0.05)
+
+    assert client.api.sent[0]["content"] == fake.REMARK, "回群的是要点，不重抄正文"
+    assert store.summaries_for("G_demo")[0]["content"] == fake.DOC, "正文进了库"
 
 
 async def test_auto_summary_failure_spends_cooldown(store, fake_bot_login, auto_on):

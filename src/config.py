@@ -163,6 +163,26 @@ class SummaryConfig(BaseModel):
     # call, so the summary is sent as an active message instead.
     passive_reply_deadline_s: int = 270
 
+    # ---- publishing (the `save_summary` tool) ------------------------------
+    # Whether an answer is a document is the model's call; these are only the
+    # floor and the budget that surround it.
+    #
+    # A submitted body shorter than this is a conversational answer wearing a
+    # document's clothes. 200 is roughly "a few topic-grouped lines" — below it,
+    # the text cannot carry a window, speakers and a conclusion at once.
+    #
+    # ⚠️ This is NOT the auto-summary fallback's floor. That one stays at
+    # `MIN_DOC_CHARS` (30) on purpose: the auto trigger counts messages since the
+    # last stored row, so refusing to store a thin row would leave the count
+    # unreset and re-summarise the same batch every cooldown, forever.
+    min_publish_chars: int = 200
+    # Documents one answer may publish. 2 leaves room to split two genuinely
+    # separate topics while capping both fragmentation and a reject↔resubmit loop.
+    max_publish_per_run: int = 2
+    # How many existing documents one answer may read in full. Bounds the context
+    # the duplicate-check can consume: listings are cheap, bodies are not.
+    max_doc_reads: int = 3
+
 
 class AutoSummaryConfig(BaseModel):
     """Summarise a group on its own once enough messages pile up.
